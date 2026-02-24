@@ -48,7 +48,7 @@ class WebsocketClientPolicy(BasePolicy):
             )
             metadata = msgpack_numpy.unpackb(conn.recv())
             return conn, metadata
-        except:
+        except Exception:
             logging.info("Connection to server with ws:// failed. Trying wss:// ...")
             
         self._uri = "wss://" + self._uri.split("//")[1]
