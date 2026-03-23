@@ -41,20 +41,56 @@ class VLAConfig(PretrainedConfig):
 
 
 class VLA(PreTrainedModel):
+    """
+    DreamZero Vision-Language-Action模型主类：组合backbone与action_head的统一接口。
+
+    【作用与原理】
+    VLA类是DreamZero模型的统一入口，采用模块化设计：
+    1. **Backbone**: 视觉-语言编码器（如IdentityBackbone、Qwen2-VL等），提取多模态特征
+    2. **ActionHead**: 动作生成头（如WANPolicyHead），基于backbone特征预测动作序列
+    3. **输入划分**: prepare_input()将统一输入字典划分为backbone_inputs和action_inputs
+    4. **前向传播**: forward()按序调用backbone→action_head，返回包含loss或action_pred的BatchFeature
+
+    【数据流位置】
+    上游：DefaultDataCollator输出的batch字典（images, text, state, action等）
+    当前：VLA
+    下游：Trainer.compute_loss()处理返回的BatchFeature中的loss
+
+    【设计模式】
+    - 松耦合：backbone和action_head通过配置文件动态实例化，可独立替换
+    - 验证机制：validate_inputs()检查输入格式，validate_data()检查输出格式
+    - 多模式支持：forward()用于训练（返回loss），get_action()用于推理（返回action_pred）
+
+    【关键概念】
+    - BACKBONE_FEATURE_KEY: "backbone_features"，backbone输出中特征张量的键名
+    - ACTION_KEY: "action_pred"，action_head推理输出的动作预测键名
+    - LOSS_KEY: "loss"，action_head训练输出的损失键名
+    """
+
     supports_gradient_checkpointing = True
     config_class = VLAConfig
-    """
-    we expect the backbone output to have a key 'backbone_features' with shape (batch_size, n, hidden_size)
-    here n is variable and can be e.g. time, 1 or user specified
-    we expect the action head output to have a key 'action_pred' with shape (batch_size, time, action_dim) during inference time
-    we expect these to have type BatchFeature, and they can of course have many other user specified keys too
-    see discussion at https://nvidia.slack.com/archives/C07T1V7L886/p1732550624654139
-    """
 
     def __init__(
         self,
         config: VLAConfig,
     ):
+        """
+        初始化VLA模型。
+
+        Args:
+            config (VLAConfig): VLA配置，包含：
+                - backbone_cfg: Backbone配置字典（如IdentityBackbone）
+                - action_head_cfg: ActionHead配置字典（如WANPolicyHead）
+                - action_horizon: 动作序列长度（如24）
+                - action_dim: 动作维度（如64）
+                - compute_dtype: 计算精度（如"float32"/"bfloat16"）
+
+        【初始化流程】
+        1. 验证config类型
+        2. 调用父类PreTrainedModel.__init__()
+        3. 通过hydra instantiate()动态创建backbone和action_head
+        4. 保存action_horizon、action_dim、compute_dtype
+        """
         assert isinstance(config.backbone_cfg, dict)
         assert isinstance(config.action_head_cfg, dict)
         super().__init__(config)
@@ -140,7 +176,47 @@ class VLA(PreTrainedModel):
         self,
         inputs: dict,
     ) -> BatchFeature:
+        """
+        训练模式前向传播：执行backbone编码→action_head预测→返回loss。
 
+        【输入】
+        - inputs (dict): DataCollator输出的batch字典，包含：
+          * "images": (B, T, H, W, 3) uint8，拼图后的视频帧
+          * "text": (B, L_text) int64，语言token ids
+          * "text_attention_mask": (B, L_text) int64，语言mask
+          * "state": (B, T_s, max_state_dim) float，状态
+          * "action": (B, T_a, max_action_dim) float，目标动作（用于计算loss）
+          * "action_mask": (B, T_a, max_action_dim) bool，动作有效mask
+          * "embodiment_id": (B,) int，本体标签
+          * "has_real_action": (B,) bool，是否计算action loss
+
+        【处理流程】
+        1. prepare_input(): 将inputs划分为backbone_inputs和action_inputs
+        2. backbone.forward(): 提取视觉-语言特征（如IdentityBackbone返回占位符）
+        3. action_head.forward(): 执行Flow Matching训练（VAE编码、加噪、DiT预测、计算MSE loss）
+        4. 返回包含loss的BatchFeature
+
+        【输出】
+        - BatchFeature: 包含训练结果的字典，必须包含：
+          * "loss": scalar tensor，总损失（反向传播用）
+          * "dynamics_loss": scalar tensor，视频/潜空间分支loss
+          * "action_loss": scalar tensor，动作分支loss
+
+        【Shape变化】
+        - inputs["images"]: (B, T, H, W, 3) → VAE编码 → latents: (B, C_lat, T_lat, H_lat, W_lat)
+        - inputs["action"]: (B, T_a, D_a) → 加噪 → noisy_actions: 同shape
+        - action_head输出loss: scalar
+
+        【调用关系】
+        - 被: VLATrainer.compute_loss()（通过model(inputs)调用）
+        - 调用: prepare_input(), backbone.forward(), action_head.forward()
+
+        Args:
+            inputs (dict): Batch输入字典。
+
+        Returns:
+            BatchFeature: 包含loss的训练输出。
+        """
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         backbone_outputs = self.backbone(backbone_inputs)
         action_head_outputs = self.action_head(backbone_outputs, action_inputs)
@@ -240,16 +316,46 @@ class VLA(PreTrainedModel):
         return video_outputs
 
     def prepare_input(self, inputs) -> Tuple[BatchFeature, BatchFeature]:
+        """
+        输入准备：划分backbone与action_head的输入，并处理设备/精度。
+
+        【输入】
+        - inputs (dict): DataCollator输出的batch字典（见forward()的输入说明）。
+
+        【处理流程】
+        1. validate_inputs(): 校验输入格式（action shape、video dtype等）
+        2. backbone.prepare_input(): 提取backbone需要的子集（如IdentityBackbone用action推断batch）
+        3. action_head.prepare_input(): 提取action_head需要的子集（通常为整个batch）
+        4. 设备/精度转换：
+           - 浮点张量：转到self.device并转换为action_head.dtype（如bfloat16）
+           - 非浮点（如images uint8）：仅转设备，保持dtype
+
+        【输出】
+        - Tuple[BatchFeature, BatchFeature]: (backbone_inputs, action_inputs)
+          * backbone_inputs: backbone专用输入（如IdentityBackbone只需要action推断B）
+          * action_inputs: action_head完整输入（images, text, state, action等）
+
+        【Shape变化】
+        - 输入张量：可能在CPU → 输出：在self.device（如cuda）
+        - 浮点精度：float32 → bfloat16（若action_head.dtype为bf16）
+        - 图像保持uint8（非浮点）
+
+        【调用关系】
+        - 被: forward(), get_action(), joint_video_action()等所有前向方法
+        - 调用: validate_inputs(), backbone.prepare_input(), action_head.prepare_input()
+
+        Returns:
+            Tuple[BatchFeature, BatchFeature]: (backbone_inputs, action_inputs)
+        """
         self.validate_inputs(inputs)
         backbone_inputs = self.backbone.prepare_input(inputs)
         action_inputs = self.action_head.prepare_input(inputs)
 
         def to_device_with_maybe_dtype(x):
-            # Only cast to self.compute_dtype if the tensor is floating
+            """将张量转移到设备，浮点张量额外转换dtype。"""
             if torch.is_floating_point(x):
                 return x.to(self.device, dtype=self.action_head.dtype)
             else:
-                # Keep original dtype
                 return x.to(self.device)
 
         backbone_inputs = tree.map_structure(to_device_with_maybe_dtype, backbone_inputs)

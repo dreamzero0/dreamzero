@@ -1,3 +1,31 @@
+"""
+WanTextEncoder — UMT5-XXL 风格的文本编码器模块。
+
+在 DreamZero 管线中属于 **Encoder 部分**（冻结），负责将 tokenized 文本序列编码为语义嵌入，
+供 CausalWanModel 的交叉注意力使用。
+
+架构层次:
+    WanTextEncoder
+    ├── token_embedding: nn.Embedding(vocab=256384, dim=4096)
+    ├── pos_embedding: T5RelativeEmbedding (可选共享)
+    ├── blocks: 24 × T5SelfAttention
+    │   ├── norm1 + T5Attention (自注意力, 无缩放)
+    │   ├── norm2 + T5FeedForward (门控 GELU FFN)
+    │   └── (可选) 独立 T5RelativeEmbedding
+    └── norm: T5LayerNorm (RMSNorm 变体)
+
+数据流位置:
+    DefaultDataCollator.collate()  →  text: (B, L_text) token IDs
+                                        text_attention_mask: (B, L_text)
+        ↓
+    WANPolicyHead.encode_prompt()
+        ↓
+    WanTextEncoder.forward(ids, mask)  →  (B, L_text, 4096)
+        ↓
+    text_projection  →  (B, L_text, 5120)  →  作为 CausalWanModel 交叉注意力 context
+
+典型维度 (UMT5-XXL): dim=4096, dim_attn=4096, dim_ffn=10240, num_heads=64, num_layers=24
+"""
 import math
 
 import torch
@@ -13,6 +41,13 @@ def fp16_clamp(x):
 
 
 class GELU(nn.Module):
+    """
+    Tanh 近似的 GELU 激活函数。
+
+    公式: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+
+    用于 T5FeedForward 的门控分支。
+    """
 
     def forward(self, x):
         return 0.5 * x * (1.0 + torch.tanh(
@@ -20,6 +55,18 @@ class GELU(nn.Module):
 
 
 class T5LayerNorm(nn.Module):
+    """
+    T5 RMSNorm：仅使用 RMS（均方根）归一化，无 bias/mean 中心化。
+
+    公式: y = weight * x / sqrt(mean(x²) + eps)
+
+    与标准 LayerNorm 不同，不减去均值，只除以 RMS，计算更高效。
+
+    Inputs:
+        x: (*, dim) — 任意前导维度，最后一维为 dim。
+    Output:
+        (*, dim) — 归一化后的张量，与输入同形。
+    """
 
     def __init__(self, dim, eps=1e-6):
         super(T5LayerNorm, self).__init__()
@@ -36,6 +83,24 @@ class T5LayerNorm(nn.Module):
 
 
 class T5Attention(nn.Module):
+    """
+    T5 多头注意力（无缩放）。
+
+    与标准 Scaled Dot-Product Attention 不同，T5 **不** 对 QK 乘积做 1/sqrt(d_k) 缩放，
+    而是通过初始化 std 控制注意力权重的量级。
+
+    当 context=None 时为自注意力；否则为交叉注意力。
+
+    Inputs:
+        x:        (B, L1, dim) — 查询序列。
+        context:  (B, L2, dim) 或 None — 键值序列（None 时退化为自注意力）。
+        mask:     (B, L2) 或 (B, L1, L2) 或 None — attention mask，0 表示屏蔽。
+        pos_bias: (1, num_heads, L1, L2) 或 None — T5 相对位置偏置。
+    Output:
+        (B, L1, dim) — 注意力输出。
+
+    被调用: T5SelfAttention.forward()
+    """
 
     def __init__(self, dim, dim_attn, num_heads, dropout=0.1):
         assert dim_attn % num_heads == 0
@@ -90,6 +155,19 @@ class T5Attention(nn.Module):
 
 
 class T5FeedForward(nn.Module):
+    """
+    T5 门控 FFN (Gated GELU Feed-Forward Network)。
+
+    结构: fc1(x) * gate(x) → dropout → fc2 → dropout
+    其中 gate = Linear + GELU，fc1 = Linear（无激活），两路逐元素相乘实现门控。
+
+    Inputs:
+        x: (B, L, dim) — 输入特征。
+    Output:
+        (B, L, dim) — 与输入同形。
+
+    被调用: T5SelfAttention.forward()
+    """
 
     def __init__(self, dim, dim_ffn, dropout=0.1):
         super(T5FeedForward, self).__init__()
@@ -111,6 +189,21 @@ class T5FeedForward(nn.Module):
 
 
 class T5SelfAttention(nn.Module):
+    """
+    T5 Encoder Block：Pre-Norm 自注意力 + 门控 FFN + 残差连接。
+
+    结构: x → Norm1 → T5Attention(self-attn + pos_bias) → + residual
+          → Norm2 → T5FeedForward(gated GELU)         → + residual
+
+    Inputs:
+        x:        (B, L, dim) — 输入 token 特征。
+        mask:     (B, L) 或 None — attention mask，0=屏蔽 padding。
+        pos_bias: (1, num_heads, L, L) 或 None — 共享相对位置偏置（shared_pos=True 时从外部传入）。
+    Output:
+        (B, L, dim) — 与输入同形。
+
+    被调用: WanTextEncoder.forward() 循环调用 24 次。
+    """
 
     def __init__(self,
                  dim,
@@ -141,11 +234,25 @@ class T5SelfAttention(nn.Module):
             x.size(1), x.size(1))
         x = fp16_clamp(x + self.attn(self.norm1(x), mask=mask, pos_bias=e))
         x = fp16_clamp(x + self.ffn(self.norm2(x)))
-        # print("x after attn: ", x[0, 0:10], x.shape)
         return x
 
 
 class T5RelativeEmbedding(nn.Module):
+    """
+    T5 相对位置编码：将相对距离映射到 bucket → 查 embedding 表 → 位置偏置。
+
+    原理: 将相对位置 (q_pos - k_pos) 量化到 num_buckets 个桶中
+    （近距离用精确桶，远距离用对数桶），然后查表得到每个 head 的 attention bias。
+
+    Inputs (forward):
+        lq: int — query 序列长度。
+        lk: int — key 序列长度。
+    Output:
+        (1, num_heads, lq, lk) — 相对位置偏置，加到注意力 logits 上。
+
+    被调用: WanTextEncoder.forward()（shared_pos=True 时在外层计算一次传给所有 block）
+           或 T5SelfAttention.forward()（shared_pos=False 时每层独立计算）。
+    """
 
     def __init__(self, num_buckets, num_heads, bidirectional, max_dist=128):
         super(T5RelativeEmbedding, self).__init__()
@@ -208,6 +315,39 @@ def init_weights(m):
 
 
 class WanTextEncoder(torch.nn.Module):
+    """
+    UMT5-XXL 风格的文本编码器（Encoder-only Transformer）。
+
+    作用:
+        将 tokenized 文本序列编码为上下文相关的语义嵌入向量。
+        在 DreamZero 中属于 **Encoder 部分**，始终冻结（requires_grad=False）。
+
+    原理:
+        1. Token Embedding: token IDs → (B, L, dim=4096)
+        2. 可选共享的 T5RelativeEmbedding: 计算相对位置偏置 (1, num_heads, L, L)
+        3. 24 层 T5SelfAttention block:
+           - Pre-Norm (RMSNorm) → 自注意力 (T5 无缩放) + 相对位置偏置 → 残差
+           - Pre-Norm → 门控 GELU FFN → 残差
+        4. 最终 RMSNorm + Dropout
+
+    Inputs (forward):
+        ids:  (B, L_text) — token IDs（由 UMT5 tokenizer 产生）。
+        mask: (B, L_text) 或 None — attention mask，1=有效 token，0=padding。
+    Output:
+        (B, L_text, dim=4096) — 每个 token 位置的上下文嵌入。
+        在 WANPolicyHead.encode_prompt() 中，padding 位置会被置零，
+        然后经 text_projection 投影到 (B, L_text, 5120) 作为 DiT 交叉注意力的 context。
+
+    上游: DefaultDataCollator.collate() 产生 text (B, L_text) + text_attention_mask (B, L_text)
+    下游: WANPolicyHead.encode_prompt() → text_projection → CausalWanModel 交叉注意力 context
+
+    预训练权重: models_t5_umt5-xxl-enc-bf16.pth
+    冻结状态: requires_grad=False，始终不训练
+
+    典型参数:
+        vocab=256384, dim=4096, dim_attn=4096, dim_ffn=10240,
+        num_heads=64, num_layers=24, num_buckets=32
+    """
 
     def __init__(self,
                  vocab: int | nn.Embedding = 256384,
@@ -251,6 +391,18 @@ class WanTextEncoder(torch.nn.Module):
         self.apply(init_weights)
 
     def forward(self, ids, mask=None):
+        """
+        前向编码。
+
+        Args:
+            ids:  (B, L_text) — token IDs。
+            mask: (B, L_text) 或 None — attention mask (1=有效, 0=padding)。
+
+        Returns:
+            (B, L_text, dim=4096) — 每个位置的上下文语义嵌入。
+
+        被调用: WANPolicyHead.encode_prompt()
+        """
         x = self.token_embedding(ids)
         x = self.dropout(x)
         if self.shared_pos:

@@ -150,6 +150,42 @@ class WANPolicyHeadConfig(PretrainedConfig):
 
 
 class WANPolicyHead(ActionHead):
+    """
+    DreamZero核心ActionHead：基于Wan2.1-I2V-14B的流匹配（Flow Matching）视频-动作联合生成模型。
+
+    【作用与原理】
+    WANPolicyHead是DreamZero模型的核心生成组件，继承自Wan2.1-I2V-14B（图像到视频生成模型），
+    并扩展了机器人动作生成能力。采用流匹配（Flow Matching）框架，联合建模：
+    1. **视频潜空间动态**: 通过VAE将视频编码到潜空间，使用CausalWanModel（DiT）预测噪声
+    2. **动作序列生成**: 通过action_encoder编码动作，DiT联合预测视频+动作噪声
+    3. **条件控制**: 语言指令（T5编码）、首帧图像（CLIP+VAE）、当前状态（state_encoder）
+
+    【架构组成】
+    - **TextEncoder**: WanTextEncoder（umt5-xxl），编码语言指令 → prompt_emb (B, L_text, D_t5)
+    - **ImageEncoder**: WanImageEncoder（CLIP），编码首帧 → clip_feas (B, D_clip)
+    - **VAE**: WanVideoVAE，编码视频 → latents (B, C_lat, T_lat, H_lat, W_lat)
+    - **CausalWanModel**: 40层因果DiT，联合预测视频噪声+动作噪声
+      * state_encoder: 编码当前状态
+      * action_encoder: 编码带噪动作序列
+      * action_decoder: 从DiT输出解码动作噪声
+    - **FlowMatchScheduler**: 流匹配调度器，管理加噪/去噪过程
+
+    【数据流位置】
+    上游：VLA.forward()传递的backbone_outputs（空）+ action_inputs（完整batch）
+    当前：WANPolicyHead
+    下游：VLA返回BatchFeature给Trainer.compute_loss()
+
+    【训练与推理模式】
+    - **训练**: forward()执行Flow Matching训练（VAE编码、加噪、DiT预测、MSE loss）
+    - **推理**: get_action()执行多步去噪（16步或4步，通过num_inference_steps控制）
+
+    【关键配置】
+    - train_architecture: "lora"或"full"，控制是否使用LoRA微调
+    - tune_projector/tune_diffusion_model: 控制可训练参数范围
+    - num_frame_per_block/num_action_per_block: DiT块粒度（影响时空对齐）
+    - decouple_video_action_noise: 是否解耦视频与动作的噪声采样
+    """
+
     config_class = WANPolicyHeadConfig
     supports_gradient_checkpointing = True
 
@@ -157,6 +193,26 @@ class WANPolicyHead(ActionHead):
         self,
         config: WANPolicyHeadConfig,
     ):
+        """
+        初始化WANPolicyHead。
+
+        Args:
+            config (WANPolicyHeadConfig): 配置对象，包含：
+                - text_encoder_cfg: T5文本编码器配置
+                - image_encoder_cfg: CLIP图像编码器配置
+                - vae_cfg: VAE配置
+                - diffusion_model_cfg: CausalWanModel配置
+                - lora_rank/lora_alpha: LoRA参数（若train_architecture="lora"）
+                - train_architecture: "lora"或"full"
+                - tune_projector/tune_diffusion_model: 可训练参数开关
+                - num_frames/num_frame_per_block/num_action_per_block: 时空粒度
+
+        【初始化流程】
+        1. 初始化各组件（text_encoder, image_encoder, vae, scheduler, model）
+        2. 加载预训练权重（T5, CLIP, VAE, DiT）
+        3. 根据train_architecture设置可训练参数（LoRA或全量）
+        4. 冻结text_encoder/image_encoder/vae（始终冻结）
+        """
         super().__init__()
         self.tiled = config.tiled
         self.tile_size_height = config.tile_size_height
@@ -584,20 +640,80 @@ class WANPolicyHead(ActionHead):
         return model
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
-        # Set frozen modules to eval
+        """
+        训练模式前向传播：执行Flow Matching训练，计算视频重建+动作预测的MSE loss。
+
+        【输入】
+        - backbone_output (BatchFeature): VLA backb输出（IdentityBackbone返回空特征）。
+        - action_input (BatchFeature): 完整batch输入，包含：
+          * "images": (B, T, H, W, 3) uint8或float，拼图后视频帧
+          * "text": (B, L_text) int64，语言token ids
+          * "text_attention_mask": (B, L_text) int64，语言mask
+          * "state": (B, T_s, max_state_dim) float，当前状态
+          * "action": (B, T_a, max_action_dim) float，目标动作（gt，用于计算loss）
+          * "action_mask": (B, T_a, max_action_dim) bool，动作有效mask
+          * "embodiment_id": (B,) int，本体标签
+          * "has_real_action": (B,) bool，是否计算action loss
+
+        【处理流程】（Flow Matching训练）
+        1. 图像归一化：uint8/255 → Normalize → [-1,1]
+        2. 文本编码：T5编码语言指令 → prompt_emb (B, L_text, D_t5)
+        3. 视频编码：VAE.encode() → latents (B, C_lat, T_lat, H_lat, W_lat)
+        4. I2V条件：CLIP编码首帧 → clip_feas；VAE编码首帧+mask → ys
+        5. 加噪（Flow Matching）:
+           - 采样timestep（视频/动作可解耦）
+           - scheduler.add_noise()对latents和actions加噪
+           - scheduler.training_target()生成flow匹配目标
+        6. DiT预测：CausalWanModel()预测视频噪声+动作噪声
+        7. Loss计算：MSE(video_noise_pred, training_target) + MSE(action_noise_pred, training_target_action)
+           - 按scheduler.training_weight(timestep)加权
+           - action loss额外乘action_mask和has_real_action
+
+        【输出】
+        - BatchFeature: 包含loss的字典：
+          * "loss": scalar tensor，总损失（dynamics_loss + weighted_action_loss）
+          * "dynamics_loss": scalar tensor，视频/潜空间分支MSE
+          * "action_loss": scalar tensor，动作分支MSE（可能为0）
+
+        【Shape变化】（以B=4, T=33, H=176, W=320为例）
+        - images: (4, 33, 352, 640, 3) → 归一化 → (4, 3, 33, 352, 640)
+        - latents (VAE 4x下采样): (4, 16, 9, 44, 80)，C_lat=16，T_lat=(33-1)//4+1=9
+        - prompt_emb: (4, 512, 2048)（L_text=512, D_t5=2048）
+        - actions: (4, 24, 64)（T_a=24, D_a=64）
+        - noise/timestep: 与latents/actions同shape
+        - video_noise_pred: 同latents (4, 16, 9, 44, 80)
+        - action_noise_pred: 同actions (4, 24, 64)
+        - loss: scalar
+
+        【调用关系】
+        - 被: VLA.forward()（训练时通过model(inputs)调用）
+        - 调用: encode_prompt(), encode_video(), encode_image(), scheduler.add_noise(),
+                scheduler.training_target(), model()（CausalWanModel）
+
+        【关键参数】
+        - decouple_video_action_noise: True时视频/动作使用独立的timestep采样
+        - noise_beta_alpha/noise_beta_beta: Beta分布参数，控制timestep采样偏向
+
+        Args:
+            backbone_output (BatchFeature): Backbone输出（空占位）。
+            action_input (BatchFeature): 完整batch输入。
+
+        Returns:
+            BatchFeature: 包含loss的训练输出。
+        """
+        # Set frozen modules to eval mode (e.g., BN behavior)
         self.set_frozen_modules_to_eval_mode()
 
         data = action_input 
         # Get embodiment ID.
         embodiment_id = action_input.embodiment_id
-        # print("embodiment_id", embodiment_id)
         has_real_action = action_input.has_real_action
         action_mask = action_input.action_mask
 
         state_features = action_input.state
 
         actions = action_input.action
-        # assert the values of action is in between -1 and 1
+        # Validate action range [-1, 1]
         if actions.numel() > 0:
             assert actions.min() >= -1.0 and actions.max() <= 1.0, "actions must be in [-1,1] range"
         videos = data["images"]
@@ -605,7 +721,7 @@ class WANPolicyHead(ActionHead):
         videos = rearrange(videos, "b t h w c -> b c t h w")
         print("videos", videos.shape)
         
-
+        # Image normalization: uint8 -> float -> [-1, 1]
         if videos.dtype == torch.uint8:
             videos = videos.float() / 255.0
             b, c, t, h, w = videos.shape
@@ -616,9 +732,10 @@ class WANPolicyHead(ActionHead):
             assert videos.min() >= -1.0 and videos.max() <= 1.0, "videos must be in [-1,1] range"
             videos = videos.to(dtype=self.dtype)
         
-        # shape of B * max_length * dim
+        # Text encoding: T5 text encoder
         prompt_embs = self.encode_prompt(data["text"], data["text_attention_mask"])
         
+        # Video encoding: VAE encode to latent space
         latents = self.encode_video(videos, self.tiled, (self.tile_size_height, self.tile_size_width), (self.tile_stride_height, self.tile_stride_width))
 
         # print("latents shape", latents.shape, self.dtype)
@@ -702,11 +819,17 @@ class WANPolicyHead(ActionHead):
         frame_seqlen = int(height * width / 4)
         seq_len = num_frames * frame_seqlen
 
+        # ==================== Flow Matching 加噪与训练目标计算 ====================
+        # 视频: timestep_id → 实际 sigma → add_noise(latents, noise, sigma) → noisy_latents
+        # training_target = noise - latents（Flow Matching 速度场: 从 clean 到 noise 的方向向量）
         timestep = self.scheduler.timesteps[timestep_id].to(self._device)
         noisy_latents = self.scheduler.add_noise(latents.flatten(0, 1), noise.flatten(0, 1), timestep.flatten(0, 1)).unflatten(0, (noise.shape[0], noise.shape[1]))
+        # training_target: (B, T_lat, C_lat, H_lat, W_lat) → transpose → (B, C_lat, T_lat, H_lat, W_lat)
         training_target = self.scheduler.training_target(latents, noise, timestep).transpose(1, 2)
         
         if actions.numel() > 0:
+            # 动作: 同样的 Flow Matching 过程，但可以使用独立的 timestep
+            # training_target_action = noise_action - actions: (B, action_horizon, action_dim)
             timestep_action = self.scheduler.timesteps[timestep_action_id].to(self._device)
             noisy_actions = self.scheduler.add_noise(
                 actions.flatten(0, 1),
@@ -719,7 +842,10 @@ class WANPolicyHead(ActionHead):
             noisy_actions = None
             training_target_action = None
 
-        # Compute loss
+        # ==================== 两个 Decoder Head 的 Loss 计算 ====================
+        # CausalWanModel 输出:
+        #   video_noise_pred: (B, C_lat, T_lat, H_lat, W_lat) — Video Head (CausalHead) 的输出
+        #   action_noise_pred: (B, action_horizon, action_dim) — Action Head (action_decoder) 的输出
         with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self._device).type):
             if actions.numel() > 0:
                 video_noise_pred, action_noise_pred = self.model(
@@ -736,30 +862,49 @@ class WANPolicyHead(ActionHead):
                     clean_x=latents.transpose(1, 2),
                 )
 
-            # Per-sample dynamics loss
+            # ---- Decoder Head #1: Video Head (CausalHead) — dynamics_loss ----
+            # target: training_target = noise - latents (Flow Matching 速度场)
+            # Shape: video_noise_pred, training_target 均为 (B, C_lat, T_lat, H_lat, W_lat)
+            # 步骤:
+            #   1. 逐像素 MSE → (B, C_lat, T_lat, H_lat, W_lat)
+            #   2. 对 C_lat, H_lat, W_lat 求均值 → (B, T_lat)
+            #   3. 乘以 training_weight(timestep) → (B, T_lat)  [高噪声时间步权重更大]
+            #   4. 全局平均 → scalar
+            # 无 mask: 所有帧和通道均参与 loss
             dynamics_loss_per_sample = torch.nn.functional.mse_loss(
                 video_noise_pred.float(), training_target.float(), reduction='none'
-            ).mean(dim=(1,3,4))  # shape: [B, ...]
+            ).mean(dim=(1,3,4))  # (B, T_lat): 对 C_lat(1), H_lat(3), W_lat(4) 求均值
 
             weight_dynamics = dynamics_loss_per_sample * self.scheduler.training_weight(timestep.flatten(0, 1)).unflatten(0, (noise.shape[0], noise.shape[1])).to(self._device)
             weighted_dynamics_loss = weight_dynamics.mean()
             
             if actions.numel() > 0:
+                # ---- Decoder Head #2: Action Head (action_decoder) — action_loss ----
+                # target: training_target_action = noise_action - actions (Flow Matching 速度场)
+                # Shape: action_noise_pred, training_target_action 均为 (B, action_horizon, action_dim)
+                # 步骤:
+                #   1. 逐元素 MSE → (B, action_horizon, action_dim)
+                #   2. × action_mask → 仅保留有效动作维度（非 padding 维）
+                #   3. × has_real_action[:, None] → 样本级 mask（无真实动作的样本整体屏蔽）
+                #   4. 对 action_dim 求均值 → (B, action_horizon)
+                #   5. × training_weight(timestep_action) → (B, action_horizon)
+                #   6. 全局平均 → scalar
                 action_loss_per_sample = torch.nn.functional.mse_loss(
                     action_noise_pred.float(), training_target_action.float(), reduction='none'
-                ) * action_mask  # shape: [B, ...]
-                action_loss_per_sample = has_real_action[:, None].float() * action_loss_per_sample  # apply has_real_action
+                ) * action_mask  # (B, action_horizon, action_dim) × (B, action_horizon, action_dim)
+                action_loss_per_sample = has_real_action[:, None].float() * action_loss_per_sample  # (B, 1) × (B, action_horizon, action_dim)
                 weight_action = action_loss_per_sample.mean(dim=2) * self.scheduler.training_weight(
                     timestep_action.flatten(0, 1),
                 ).unflatten(0, (noise_action.shape[0], noise_action.shape[1])).to(self._device)
                 weighted_action_loss = weight_action.mean()
+                # 总损失 = dynamics_loss + action_loss（等权相加，无额外系数）
                 loss = weighted_dynamics_loss + weighted_action_loss
             else:
                 weighted_action_loss = torch.tensor(0.0, device=self._device)
                 loss = weighted_dynamics_loss
-            # loss = dynamics_loss_per_sample.mean()
 
-        # Record log
+        # 输出: loss(反传), dynamics_loss(Video Head 指标), action_loss(Action Head 指标)
+        # BaseTrainer.compute_loss 取 loss 反传，对 *_loss 计算滑动平均写入 loss_log.jsonl
         output_dict = {
             "loss": loss,
             "dynamics_loss": weighted_dynamics_loss,

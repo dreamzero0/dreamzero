@@ -318,51 +318,88 @@ class BaseSampler(Sampler):
 
 
 class BaseTrainer(transformers.Trainer):
+    """
+    DreamZero基础Trainer：扩展HuggingFace Trainer，支持多模态VLA模型训练。
+
+    【作用与原理】
+    BaseTrainer继承自transformers.Trainer，专为DreamZero多模态训练场景定制：
+    1. **计时系统**: ContextTimer跟踪训练各阶段耗时（model_forward, compute_loss等）
+    2. **Profiling支持**: 可选的PyTorch Profiler和内存分析（每N步导出trace）
+    3. **多Loss跟踪**: 维护loss_queues字典，跟踪dynamics_loss/action_loss等移动平均
+    4. **分布式感知**: 自动获取WORLD_SIZE/RANK等环境变量
+    5. **ShardedDataset支持**: 自定义get_train_dataloader()支持IterableDataset（ShardedLeRobotMixtureDataset）
+
+    【数据流位置】
+    上游：DataLoader → 生成inputs（batch dict）
+    当前：BaseTrainer.training_step()/compute_loss()
+    下游：优化器.step()更新模型参数
+
+    【关键扩展】
+    - training_step(): 包装父类方法，添加计时和profiling
+    - compute_loss(): 调用model(inputs)，提取outputs["loss"]，跟踪附加loss
+    - create_optimizer(): 分组weight decay（bias/no decay）
+    - get_train_dataloader(): 对ShardedLeRobotMixtureDataset特殊处理（resume时重置seed）
+
+    【配置参数】
+    - compute_dtype: 计算精度（如"bfloat16"）
+    - enable_profiling: 是否启用详细性能分析
+    - profiling_steps: 分析间隔步数
+    """
 
     def __init__(self, **kwargs):
-        # Increase the cache size limit for torch._dynamo to
-        # accommodate videos with different numbers of frames.
+        """
+        初始化BaseTrainer。
+
+        Args:
+            **kwargs: Trainer参数，外加：
+                - compute_dtype: 计算精度
+                - output_dir: 输出目录
+                - enable_profiling: 是否启用profiling
+                - profiling_steps: profiling间隔
+
+        【初始化流程】
+        1. 设置torch._dynamo.config.cache_size_limit（支持变长视频）
+        2. 弹出并保存DreamZero特有参数（compute_dtype/output_dir/profiling相关）
+        3. 获取分布式环境变量
+        4. 若启用profiling，创建目录并启动内存记录
+        5. 调用父类Trainer.__init__()
+        6. 初始化loss_queues用于移动平均跟踪
+        """
+        # Increase the cache size limit for torch._dynamo to accommodate videos with different numbers of frames.
         torch._dynamo.config.cache_size_limit = 1000
 
         self.compute_dtype = kwargs.pop("compute_dtype")
         self.output_dir = kwargs.pop("output_dir")
         self.timer = ContextTimer(self)
 
+        # Distributed environment
         self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
         self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         self.global_rank = int(os.environ.get("RANK", "0"))
         self.node_rank = int(os.environ.get("NODE_RANK", "0"))
 
-        # Get distributed info
         self.current_step = 0
 
-        # Profiling (legacy per-step profiling)
+        # Profiling configuration
         self.enable_profiling = kwargs.pop("enable_profiling", False)
         self.profiling_steps = kwargs.pop("profiling_steps", 5)
-        # Pop new ProfCallback config options (handled in create_trainer, not here)
-        kwargs.pop("enable_prof_callback", None)
-        kwargs.pop("profile_start_step", None)
-        kwargs.pop("profile_warmup_steps", None)
-        kwargs.pop("profile_active_steps", None)
-        kwargs.pop("profile_record_shapes", None)
-        kwargs.pop("profile_with_stack", None)
-        kwargs.pop("profile_memory", None)
-        kwargs.pop("msc_profile_url", None)
-        kwargs.pop("profile_delete_after_upload", None)
+        # Pop ProfCallback config options
+        for key in ['enable_prof_callback', 'profile_start_step', 'profile_warmup_steps',
+                    'profile_active_steps', 'profile_record_shapes', 'profile_with_stack',
+                    'profile_memory', 'msc_profile_url', 'profile_delete_after_upload']:
+            kwargs.pop(key, None)
+
         if self.enable_profiling:
-            # Setup profiling directories
             self.profile_dir = Path(self.output_dir) / "profiling"
             self.memory_profile_dir = self.profile_dir / "memory"
             self.torch_profile_dir = self.profile_dir / "torch"
-
             self.memory_profile_dir.mkdir(exist_ok=True, parents=True)
             self.torch_profile_dir.mkdir(exist_ok=True, parents=True)
-
-            # Start recording the memory history.
             torch.cuda.memory._record_memory_history(max_entries=100000)
 
         super().__init__(**kwargs)
 
+        # Loss tracking queues for moving average
         self.loss_queues = {}
         self.loss_queue_size = 10
 
@@ -406,28 +443,72 @@ class BaseTrainer(transformers.Trainer):
         return output
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """
+        计算训练损失：调用模型前向传播，提取loss，跟踪附加loss的移动平均。
+
+        【输入】
+        - model: VLA模型实例（在GPU上，可能包装为DeepSpeed/DDP）
+        - inputs (dict): DataLoader输出的batch字典，包含images/text/state/action等
+        - return_outputs (bool): 是否返回完整outputs（用于某些训练策略）
+        - num_items_in_batch (int | None): batch内有效样本数（某些情况下用于归一化）
+
+        【处理流程】
+        1. model_forward阶段: 调用model(inputs)执行VLA前向传播
+           - VLA.forward() → WANPolicyHead.forward() → Flow Matching训练
+           - 计时：通过self.timer记录前向传播耗时
+        2. Loss提取: 从outputs中提取主loss（用于反向传播）
+        3. 附加loss跟踪:
+           - 识别所有以"_loss"结尾的键（如"dynamics_loss", "action_loss"）
+           - 维护loss_queues字典，记录最近10步的loss值
+           - 每10步计算移动平均并通过self.log()记录到wandb
+
+        【输出】
+        - loss (tensor): 标量张量，主损失（outputs["loss"]），用于反向传播
+        - 若return_outputs=True，返回(loss, outputs)元组
+
+        【调用关系】
+        - 被: HuggingFace Trainer基类（在training_step中调用）
+        - 调用: model(inputs) → VLA.forward() → WANPolicyHead.forward()
+
+        【Shape细节】
+        - inputs各张量: (B, ...)（见VLA.forward()输入说明）
+        - outputs["loss"]: scalar tensor ()
+        - outputs["dynamics_loss"]/"action_loss": scalar tensor
+
+        Args:
+            model: VLA模型。
+            inputs (dict): Batch输入字典。
+            return_outputs (bool): 是否返回完整输出。
+            num_items_in_batch (int | None): batch有效样本数。
+
+        Returns:
+            tensor or tuple: loss或(loss, outputs)。
+        """
+        # Stage 1: Model forward with timing
         with self.timer.with_label("model_forward"):
             outputs = model(inputs)
-        ### For additional losses, track and log their moving averages
+
+        # Stage 2: Track additional losses with moving average
         for key, value in outputs.items():
             if key.endswith("_loss") and key != "loss":
-                # Initialize queue if not exists
+                # Initialize queue for this loss type
                 if key not in self.loss_queues:
                     self.loss_queues[key] = []
 
-                # Add current loss value to queue
+                # Add current loss value
                 current_value = value.item() if torch.is_tensor(value) else value
                 self.loss_queues[key].append(current_value)
 
-                # Keep only last N values
+                # Maintain queue size
                 if len(self.loss_queues[key]) > self.loss_queue_size:
                     self.loss_queues[key].pop(0)
 
-                # Log average every 10 steps
+                # Log moving average every N steps
                 if self.current_step % self.loss_queue_size == 0:
                     avg_loss = sum(self.loss_queues[key]) / len(self.loss_queues[key])
                     self.log({f"{key}_avg": avg_loss})
 
+        # Stage 3: Extract main loss for backward
         loss = outputs["loss"]
 
         return (loss, outputs) if return_outputs else loss

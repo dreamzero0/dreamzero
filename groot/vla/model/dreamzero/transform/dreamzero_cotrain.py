@@ -160,64 +160,158 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
 
 
 class DefaultDataCollator(DataCollatorMixin):
+    """
+    DreamZero默认数据整理器：将DreamTransform输出的单样本列表整理为训练batch。
+
+    【作用与原理】
+    该类是DataLoader的collator，负责：
+    1. 调用collate()函数将样本列表整理为batch tensor
+    2. 管理tokenizer（HuggingfaceTokenizer，基于umt5-xxl）
+    3. 处理语言tokenization：将字符串指令转为input_ids和attention_mask
+    4. 处理多视角图像拼接（根据num_views和embodiment_tag）
+
+    【数据流位置】
+    上游：DreamTransform.apply()输出的单样本字典列表（长度=batch_size）
+    当前：DefaultDataCollator
+    下游：VLA模型（WANPolicyHead等）
+
+    【关键操作】
+    - 语言处理：通过HuggingfaceTokenizer进行tokenize，padding到max_length
+    - 张量堆叠：numpy数组→torch.stack→batch tensor
+    - 本体特定处理：不同embodiment（DROID/AgiBot/GR1等）有不同的语言前缀模板
+
+    【配置参数】
+    - tokenizer_path: "google/umt5-xxl"（WAN2.1使用的文本编码器）
+    - max_length: 512（最大token长度）
+    - num_views: 视角数量（DROID=3，AgiBot=4等）
+    """
+
     def __init__(self, tokenizer_path: str="google/umt5-xxl", max_length: int=512, num_views: int=1, embodiment_tag_mapping=None):
+        """
+        初始化DataCollator。
+
+        Args:
+            tokenizer_path (str): HuggingFace tokenizer路径（默认umt5-xxl）。
+            max_length (int): 语言序列最大长度（默认512）。
+            num_views (int): 相机视角数量（决定图像处理逻辑）。
+            embodiment_tag_mapping (dict): 本体标签到整数的映射表。
+        """
         super().__init__()
         self.tokenizer = HuggingfaceTokenizer(name=tokenizer_path, seq_len=max_length, clean='whitespace')
         self.num_views = num_views
         self.embodiment_tag_mapping = embodiment_tag_mapping
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        整理样本列表为batch。
+
+        【输入】
+        - features (List[dict]): DreamTransform输出的样本列表，长度=B。
+          每个元素为包含"images", "text", "state", "action"等的字典。
+
+        【输出】
+        - dict: Batch字典，所有值都是torch.Tensor（除text已tokenize）。
+          例如：{
+            "images": (B, T, H, W, 3) uint8,
+            "text": (B, L_text) int64,
+            "text_attention_mask": (B, L_text) int64,
+            "state": (B, T_s, max_state_dim) float,
+            "action": (B, T_a, max_action_dim) float,
+            ...
+          }
+
+        【调用关系】
+        - 被: DataLoader（通过PyTorch DataLoader接口）
+        - 调用: collate()函数（本文件内定义）
+
+        Returns:
+            Dict[str, Any]: Batch化的数据字典。
+        """
         return collate(features, self.tokenizer, self.num_views, self.embodiment_tag_mapping)
 
 
 class DreamTransform(InvertibleModalityTransform):
+    """
+    DreamZero模型专用变换：将LeRobot格式的多模态数据转换为模型输入格式。
+
+    【作用与原理】
+    该类是数据管道的最后一步变换，负责：
+    1. **Video拼图处理**：将多相机图像拼接为2×2网格（DROID：腕部顶行全宽，双外参底行；其他：左上/左下/右上/右下）
+    2. **语言处理**：从多语言键中选择指令，添加本体特定前缀，支持语言dropout
+    3. **State/Action Padding**：将state/action填充到统一维度（max_state_dim/max_action_dim）
+    4. **特殊模式支持**：LAPA/DREAM/COTRAIN等联合训练模式的数据路由
+    5. **生成mask**：state_mask/action_mask标记有效维度
+
+    【数据流位置】
+    上游：ConcatTransform（已拼接多view、多键的state/action）
+    当前：DreamTransform
+    下游：DefaultDataCollator → VLA模型
+
+    【核心处理】
+    - DROID拼图：3个view → 1路2×2网格（腕部顶行横向拉伸，左右外参底行并排）
+    - 语言前缀：根据embodiment_tag添加描述多视角布局的固定前缀
+    - Padding：不足max_dim则补0，生成对应mask
+    - 特殊标签：is_lapa_instance/is_dream_instance控制后续loss路由
+
+    【配置参数】
+    - max_state_dim/max_action_dim: 统一维度（如64）
+    - state_horizon/action_horizon: 时间步数（如1/24）
+    - default_instruction: 语言dropout时的默认指令
+    - language_dropout_prob: 语言dropout概率（训练时随机替换为默认指令）
+    """
 
     # -- We inherit from ModalityTransform, so we keep apply_to as well --
     apply_to: list[str] = Field(
-        default_factory=list, description="Not used in this transform, kept for compatibility."
+        default_factory=list, description="此transform不使用apply_to，保留用于兼容性。"
     )
     training: bool = Field(
-        default=True, description="Whether to apply the transform in training mode."
+        default=True, description="是否训练模式（影响语言dropout和拼图随机性）。"
     )
 
-    formalize_language: bool = Field(default=False, description="Formalize language if True.")
+    formalize_language: bool = Field(default=False, description="是否规范化语言格式。")
 
     embodiment_tag_mapping: dict[str, int] = Field(
         default_factory=dict,
-        description="The projector index of each embodiment tag.",
+        description="本体标签到projector索引的映射（如{'oxe_droid': 26, 'agibot': 17}）。",
     )
 
     language_dropout_prob: float = Field(
         default=0.0,
-        description="Dropout probability for language.",
+        description="语言dropout概率（训练时随机概率替换为默认指令）。",
     )
     always_use_default_instruction: bool = Field(
         default=False,
-        description="Whether to always use the default instruction. For studying how much the language helps.",
+        description="是否总是使用默认指令（用于ablation研究语言作用）。",
     )
 
     # Private attributes to keep track of shapes/dimensions across apply/unapply
-    _language_key: Optional[str] = PrivateAttr(default=None)
-    _language_keys: Optional[list[str]] = PrivateAttr(default=None)
+    _language_key: Optional[str] = PrivateAttr(default=None)  # 当前使用的语言键
+    _language_keys: Optional[list[str]] = PrivateAttr(default=None)  # 所有可用语言键
 
     # XEmbDiT arguments
-    default_instruction: str
-    max_state_dim: int
-    max_action_dim: int
-    max_length: int = 512
-    embodiment_tag: EmbodimentTag | None = None
-    state_horizon: int
-    action_horizon: int
-    num_views: int = 3
+    default_instruction: str  # 默认语言指令
+    max_state_dim: int  # state最大维度（如64）
+    max_action_dim: int  # action最大维度（如64）
+    max_length: int = 512  # 语言序列最大长度
+    embodiment_tag: EmbodimentTag | None = None  # 当前本体标签
+    state_horizon: int  # state时间步数（如1）
+    action_horizon: int  # action时间步数（如24）
+    num_views: int = 3  # 相机视角数
 
-    # Add tokenizer attribute
+    # Tokenizer（用于长度检查，实际tokenize在Collator中进行）
     tokenizer_path: str = Field(
         default="google/umt5-xxl",
-        description="Path to the tokenizer."
+        description="Tokenizer路径（与Collator一致）。"
     )
     _tokenizer: Optional[HuggingfaceTokenizer] = PrivateAttr(default=None)
     
     def __init__(self, **kwargs):
+        """
+        初始化DreamTransform。
+
+        Args:
+            **kwargs: 配置参数，包括default_instruction, max_state_dim, max_action_dim等。
+        """
         super().__init__(**kwargs)
         # Initialize the tokenizer
         self._tokenizer = HuggingfaceTokenizer(
@@ -228,11 +322,16 @@ class DreamTransform(InvertibleModalityTransform):
     
     @property
     def tokenizer(self):
+        """获取tokenizer实例。"""
         return self._tokenizer
 
-    def set_metadata(
-        self, dataset_metadata: DatasetMetadata
-    ):
+    def set_metadata(self, dataset_metadata: DatasetMetadata):
+        """
+        从数据集metadata设置本体标签。
+
+        Args:
+            dataset_metadata (DatasetMetadata): 包含embodiment_tag的数据集元数据。
+        """
         self.embodiment_tag = dataset_metadata.embodiment_tag
 
     def get_embodiment_tag(self) -> int:
@@ -496,22 +595,73 @@ class DreamTransform(InvertibleModalityTransform):
         return actions, actions_mask, n_action_tokens
 
     def apply_single(self, data: dict) -> dict:
+        """
+        处理单样本，将LeRobot格式转换为DreamZero模型输入格式。
+
+        【输入】
+        - data (dict): ConcatTransform输出的字典，包含：
+          * "video": (T, V, H, W, C) uint8，多view已拼接
+          * "state": (T, D_state) 已归一化
+          * "action": (T_a, D_action) 已归一化
+          * "annotation.language.xxx": str 语言指令（可能有多个键）
+          * 其他：timestamp, embodiment_id等
+
+        【处理流程】
+        1. Video拼图：调用_prepare_video()进行2×2网格拼接
+        2. 语言处理：调用_prepare_language()选择语言键，解析<LAPA>/<DREAM>/<COTRAIN>标签
+        3. VLM预处理：调用_apply_vlm_processing()调整维度顺序
+        4. State处理：调用_prepare_state()填充到max_state_dim，生成mask
+        5. Action处理：调用_prepare_action()填充到max_action_dim，生成mask
+        6. 特殊模式：根据标签设置is_lapa_instance/is_dream_instance等路由标记
+        7. 组装输出字典
+
+        【输出】
+        - dict: 模型就绪的单样本字典，包含：
+          * "images": (1, T, C, 2H, 2W) uint8（拼图后）→ VLM处理后可展平为(T, 2H, 2W, C)
+          * "text": str 语言指令（待Collator tokenize）
+          * "state": (T_s, max_state_dim) float，已填充
+          * "state_mask": (T_s, max_state_dim) bool，有效维为True
+          * "action": (T_a, max_action_dim) float，已填充
+          * "action_mask": (T_a, max_action_dim) bool，有效维为True
+          * "has_real_action": bool，是否计算action loss
+          * "embodiment_id": int，本体标签
+          * "is_lapa_instance"/"is_dream_instance"/"is_cotrain_instance": bool 路由标记
+          * "text_negative": str 负向提示（用于CFG）
+
+        【Shape示例】（DROID，num_frames=25, action_horizon=24）
+        - 输入video: (25, 3, 256, 320, 3)
+        - 输出images: (1, 25, 3, 512, 640)（拼图后2H=512, 2W=640）
+        - 输出state: (1, 64)（原8维填充到64）
+        - 输出action: (24, 64)（原8维填充到64）
+
+        【调用关系】
+        - 被: apply()（batch拆分后）
+        - 调用: _prepare_video(), _prepare_language(), _prepare_state(), _prepare_action(),
+                _apply_vlm_processing()
+
+        Returns:
+            dict: 处理后的单样本字典。
+        """
         transformed_data = {}
 
-        # 1) Prepare video and language with vlm processing.
+        # 1) Video拼图：多view → 2×2网格
         images = self._prepare_video(data)
         images = images.astype(np.uint8)
+
+        # 2) 语言处理：选择语言键，解析特殊标签
         language, is_lapa_instance, is_dream_instance, is_cotrain_instance = self._prepare_language(data)
         batch_data = {"images": images, "language": language}
+
+        # 3) VLM预处理：调整维度顺序
         vlm_outputs = self._apply_vlm_processing(batch_data)
 
-        # 2) Prepare state
+        # 4) State处理：填充+mask
         state, state_mask, _ = self._prepare_state(data)
         transformed_data["state"] = state
         transformed_data["state_mask"] = state_mask
 
         if self.training:
-            # 3) Prepare actions
+            # 5) Action处理：填充+mask，检测特殊模式
             is_detection_instance = self.embodiment_tag == EmbodimentTag.GR1_UNIFIED_SEGMENTATION
             if is_detection_instance:
                 transformed_data["segmentation_target"] = data["action"][0, -3:-1]

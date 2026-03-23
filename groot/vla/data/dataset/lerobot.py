@@ -116,7 +116,29 @@ class ModalityConfig(BaseModel):
 
 class LeRobotSingleDataset(Dataset):
     """
-    Base dataset class for LeRobot that supports sharding.
+    LeRobot单数据集类：从LeRobot格式（parquet+视频）加载多模态机器人数据。
+
+    【作用与原理】
+    该类是DreamZero数据管道的核心入口，负责：
+    1. 读取LeRobot格式的meta信息（info.json/modality.json/episodes.jsonl等）
+    2. 根据ModalityConfig定义的delta_indices采样时间窗口
+    3. 从parquet加载state/action/语言等低维数据
+    4. 从mp4视频文件按时间戳采样图像帧
+    5. 支持相对动作归一化（relative_action）和分块读取（chunk）
+
+    【数据流位置】
+    上游：磁盘LeRobot格式数据集（由convert_droid.py等生成）
+    下游：ComposedModalityTransform → DreamTransform → Collator → VLA模型
+
+    【关键概念】
+    - delta_indices: 相对base_index的时间偏移，决定每个sample的时间窗口长度
+    - step_filter: 过滤某些episode的特定step（用于过滤静止帧等）
+    - modality: 数据模态（video/state/action/language/lapa_action/dream_actions等）
+
+    【典型配置示例】（DROID）
+    - video.delta_indices: [0..24] → T_video=25帧
+    - action.delta_indices: [0..23] → T_action=24步
+    - state.delta_indices: [0] → T_state=1步
     """
 
     def __init__(
@@ -137,25 +159,36 @@ class LeRobotSingleDataset(Dataset):
         relative_action_per_horizon: bool = False,
     ):
         """
-        Initialize the dataset.
+        初始化LeRobot数据集。
 
         Args:
-            dataset_path (Path | str): The path to the dataset.
-            modality_configs (dict[str, ModalityConfig]): The configuration for each modality. The keys are the modality names, and the values are the modality configurations.
-                See `ModalityConfig` for more details.
-            use_global_metadata (bool): Whether to use global metadata for normalization.
-            metadata_version (str): The version of the metadata, if `use_global_metadata` is True.
-            video_backend (str): Backend for video reading.
-            video_backend_kwargs (dict): Keyword arguments for the video backend when initializing the video reader.
-            transforms (ComposedModalityTransform): The transforms to apply to the dataset.
-            embodiment_tag (EmbodimentTag): Overload the embodiment tag for the dataset. e.g. define it as "new_embodiment"
-            relative_action (bool): Whether to use relative action stats for normalization. If True, will load or calculate
-                relative action stats from relative_stats_dreamzero.json. If the file doesn't exist, stats will be calculated.
-            relative_action_keys (list[str] | None): List of action keys to apply relative action to (e.g., ['joint_position']).
-                If None and relative_action is True, applies to all action keys except those containing 'gripper'.
-            relative_action_per_horizon (bool): Whether to use per-horizon relative action stats. If True, will load or calculate
-                separate stats for each action horizon index from relative_horizon_stats_dreamzero.json.
-        """
+            dataset_path (Path | str): LeRobot数据集根目录路径（包含meta/和data/）。
+            modality_configs (dict[str, ModalityConfig]): 各模态的配置字典。
+                key: 模态名（"video"/"state"/"action"/"language"等）。
+                value: ModalityConfig，定义delta_indices和modality_keys。
+            embodiment_tag (str | EmbodimentTag): 本体标识（如"oxe_droid"/"agibot"）。
+            use_global_metadata (bool): 是否使用全局预计算统计信息（而非每个数据集独立计算）。
+            metadata_version (str | None): 全局元数据版本（如"0221"）。
+            video_backend (str): 视频读取后端（"ffmpeg"/"decord"/"torchvision_av"）。
+            video_backend_kwargs (dict | None): 视频后端参数。
+            transforms (ComposedModalityTransform | None): 数据变换管道（ToTensor/Resize/Normalize等）。
+            discard_bad_trajectories (bool): 是否丢弃meta中标记为失败的episode。
+            fps (float | None): 视频帧率（覆盖dataset默认）。
+            max_chunk_size (int | None): 每个chunk的episode数量（用于分块读取）。
+            relative_action (bool): 是否使用相对动作（当前step与初始step的差）。
+            relative_action_keys (list[str] | None): 应用relative action的键列表。
+            relative_action_per_horizon (bool): 是否为每个horizon位置单独计算relative stats。
+
+        【初始化流程】
+        1. 加载meta/modality.json → lerobot_modality_meta
+        2. 加载meta/info.json → lerobot_info_meta（含data_path/video_path/chunk_size等）
+        3. 加载meta/stats.json → lerobot_stats_meta（归一化统计）
+        4. 加载meta/episodes.jsonl → trajectory_ids/trajectory_lengths
+        5. 加载step_filter（如有）→ 确定可用的base_index
+        6. 生成all_steps列表（所有可采样的(trajectory_id, base_index)对）
+        7. 加载relative stats（如启用relative_action）
+        8. 设置transforms的metadata
+        """"
         # first check if the path directory exists
         if not Path(dataset_path).exists():
             raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
@@ -1265,10 +1298,19 @@ class LeRobotSingleDataset(Dataset):
         self.epoch = epoch
 
     def __len__(self) -> int:
-        """Get the total number of data points in the dataset.
+        """
+        获取数据集的总样本数。
+
+        【原理】
+        返回self.all_steps的长度，即所有可采样的(trajectory_id, base_index)对的数量。
+        每个样本对应一个控制步（base_index），根据各模态的delta_indices可提取时间窗口。
+
+        【计算方式】
+        all_steps = sum_{trajectory} len(step_filter[trajectory])
+        若启用discard_bad_trajectories，则排除discarded_episode_indices中的episode。
 
         Returns:
-            int: the total number of data points in the dataset.
+            int: 数据集总样本数（所有可采样的控制步）。
         """
         return len(self.all_steps)
 
@@ -1277,13 +1319,40 @@ class LeRobotSingleDataset(Dataset):
         return f"{self.dataset_name} ({len(self)} steps)"
 
     def __getitem__(self, index: int) -> dict:
-        """Get the data for a single step in a trajectory.
+        """
+        获取单个训练样本（经过transforms的完整数据）。
+
+        【作用】
+        这是Dataset的核心接口，被DataLoader调用。流程：
+        1. 从all_steps[index]获取(trajectory_id, base_index)
+        2. 为每个modality_key计算采样索引：indices[key] = base_index + delta_indices[key]
+        3. 调用get_step_data加载原始数据（video/state/action/language）
+        4. 应用transforms（ComposedModalityTransform → DreamTransform）
+
+        【输入输出】
+        - 输入: index (int) - 样本在all_steps中的索引，范围[0, len(self))
+        - 输出: dict - 经过transform后的数据字典，键包括：
+          * "video": (T_v, V, H, W, C) uint8 或经变换后的张量
+          * "state": (T_s, D_state) float
+          * "action": (T_a, D_action) float
+          * "language": str 或 list[str]
+          * 经DreamTransform后还有"images", "text", "state_mask", "action_mask"等
+
+        【调用关系】
+        - 被: DataLoader（通过PyTorch Dataset接口）
+        - 调用: get_step_data() → transforms()
+
+        【时间窗口对齐】
+        假设base_index=100，video.delta_indices=[0,1,2]，action.delta_indices=[0,1]：
+        - video采样索引: [100, 101, 102] → 3帧
+        - action采样索引: [100, 101] → 2步
+        - 两者在base_index=100处对齐，但长度可能不同
 
         Args:
-            index (int): The index of the step to get.
+            index (int): 样本索引。
 
         Returns:
-            dict: The data for the step.
+            dict: 经过transforms处理后的完整样本数据。
         """
         trajectory_id, base_index = self.all_steps[index]
         indices = {
@@ -1292,20 +1361,54 @@ class LeRobotSingleDataset(Dataset):
         return self.transforms(self.get_step_data(trajectory_id, indices))
 
     def get_step_data(self, trajectory_id: int, indices: dict[str, np.ndarray]) -> dict:
-        """Get the RAW data for a single step in a trajectory. No transforms are applied.
+        """
+        获取单个控制步的原始数据（未应用transforms）。
+
+        【作用】
+        从磁盘加载指定trajectory和indices的多模态原始数据。是__getitem__的核心实现。
+        自动加载并缓存当前trajectory的parquet数据（通过curr_traj_data）。
+
+        【原理】
+        1. 检查并加载trajectory的parquet数据到self.curr_traj_data（带缓存机制）
+        2. 遍历所有modality_keys，为每个key调用get_data_by_modality()
+        3. video模态：通过时间戳从mp4采样帧
+        4. state/action模态：从parquet列切片，根据modality.json的start/end提取子向量
+        5. language模态：从parquet的task_index列通过tasks表解析为字符串
+
+        【输入输出】
+        - 输入:
+          * trajectory_id (int): Episode索引（如0,1,2...）
+          * indices (dict[str, np.ndarray]): 每个modality_key的采样索引数组
+            例如: {"video.exterior_image_1_left": array([100,101,102]), ...}
+        - 输出: dict - 原始数据字典，结构：
+          * "video": {"video.xxx": (T_v, H, W, C) uint8, ...}
+          * "state": {"state.xxx": (T_s, D) float, ...}
+          * "action": {"action.xxx": (T_a, D) float, ...}
+          * "language": str 或 list[str]
+          * "timestamp": (T,) float
+          * "frame_index": (T,) int
+
+        【Shape细节】
+        - video每个key: (len(indices[key]), H, W, C)，C=3，H/W为原始视频分辨率
+        - state/action每个key: (len(indices[key]), D)，D为该键的维度（由modality.json定义）
+        - 若indices包含负值或越界，通过retrieve_data_and_pad做padding
+
+        【调用关系】
+        - 被: __getitem__()
+        - 调用: get_trajectory_data()加载parquet，get_data_by_modality()分模态处理
 
         Args:
-            trajectory_id (int): The name of the trajectory.
-            indices (dict[str, np.ndarray]): The indices for each modality.
+            trajectory_id (int): Episode索引。
+            indices (dict[str, np.ndarray]): 各modality_key的采样索引。
 
         Returns:
-            dict: The RAW data for the step.
+            dict: 原始多模态数据（未transform）。
 
         Example return:
             {
                 "video": {
-                    "video.image_side_0": [B, T, H, W, C],
-                    "video.image_side_1": [B, T, H, W, C],
+                    "video.image_side_0": (T, H, W, C) uint8 array,
+                    "video.image_side_1": (T, H, W, C) uint8 array,
                 },
                 "state": {
                     "state.eef_position": [B, T, state_dim],

@@ -320,7 +320,29 @@ class ShardedLeRobotSingleDataset(LeRobotSingleDataset):
 
 class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
     """
-    A single dataset with shards.
+    DROID专用分块单数据集类：支持shard缓存和预加载，优化大规模数据集训练效率。
+
+    【作用与原理】
+    继承LeRobotSingleDataset，增加了分片（shard）机制，用于高效处理大规模DROID数据集：
+    1. 将trajectory按步数切分为多个shard（默认约10000步/shard）
+    2. 支持shard级缓存：预加载整个shard的parquet和视频数据到内存
+    3. 使用ThreadPoolExecutor预加载下一个shard，实现I/O与计算重叠
+    4. 专为IterableDataset设计，配合ShardedLeRobotMixtureDataset使用
+
+    【数据流位置】
+    上游：磁盘LeRobot数据集
+    下游：ShardedLeRobotMixtureDataset（多数据集混合采样）→ DreamTransform → Collator
+
+    【核心机制】
+    - Shard生成：按num_steps_per_shard将trajectory分组，确保每个shard总步数≈目标值
+    - 缓存策略：维护当前shard（cached_shard/cached_df）和预加载任务（_cache_job）
+    - 路径预计算：初始化时预计算所有video/parquet路径，避免运行时反复查找
+
+    【适用场景】
+    大规模DROID数据集（数十万episode），需要：
+    - 流式读取避免全量加载内存
+    - 顺序访问模式下通过shard缓存提高I/O效率
+    - 多数据集混合训练（通过ShardedLeRobotMixtureDataset）
     """
 
     def __init__(
@@ -329,6 +351,22 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         num_steps_per_shard: int = int(1e4),
         **kwargs,
     ):
+        """
+        初始化DROID分块数据集。
+
+        Args:
+            *args: 传递给LeRobotSingleDataset的位置参数。
+            num_steps_per_shard (int): 每个shard的目标步数（默认10000）。
+                实际shard大小可能略有偏差，以完整trajectory为单位。
+            **kwargs: 传递给LeRobotSingleDataset的关键字参数。
+
+        【初始化流程】
+        1. 调用父类LeRobotSingleDataset.__init__()完成基础加载
+        2. 预计算all_video_paths和all_parquet_paths（所有trajectory的路径映射）
+        3. 调用generate_shards()生成分片方案
+        4. 初始化shard缓存相关属性（shard_start_indices, cached_shard, cached_df等）
+        5. 创建ThreadPoolExecutor用于异步预加载
+        """
         self.args = args
         self.kwargs = kwargs
         super().__init__(*args, **kwargs)
@@ -1277,8 +1315,39 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
 
 class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
     """
-    A mixture of multiple datasets. This class samples a single dataset based on the dataset weights and then calls the `__getitem__` method of the sampled dataset.
-    It is recommended to modify the single dataset class instead of this class.
+    多数据集混合采样器：基于权重在多个ShardedLeRobotSingleDataset间采样，支持shard级流式迭代。
+
+    【作用与原理】
+    该类是DreamZero支持多本体（multi-embodiment）混合训练的核心组件：
+    1. 维护多个子数据集（如DROID、AgiBot、YAM等）及其采样权重
+    2. 在shard级别采样（而非单个样本），提高I/O效率
+    3. 支持两种权重平衡策略：
+       - balance_dataset_weights: 按数据集总步数加权
+       - balance_trajectory_weights: 在数据集内按trajectory长度加权
+    4. 作为IterableDataset，通过__iter__生成无限流式样本（配合Trainer多epoch训练）
+
+    【数据流位置】
+    上游：多个ShardedLeRobotSingleDataset（或子类）
+    下游：DataLoader → DreamTransform → DefaultDataCollator → VLA模型
+
+    【采样流程】
+    1. 计算全局shard权重：合并所有数据集的shard，按(shard_length × dataset_weight)加权
+    2. __iter__迭代时：
+       a. 按权重随机选一个shard（含dataset_id和shard_idx）
+       b. 让对应数据集加载并缓存该shard
+       c. 从该shard中按shard_sampling_rate采样若干step
+       d. 对每个sample调用dataset.__getitem__()获取完整数据
+    3. 预加载下一个shard实现I/O overlap
+
+    【适用场景】
+    - 多本体联合训练（DROID + AgiBot + YAM等）
+    - 超大规模数据集（无法全量加载内存）
+    - 需要灵活调整各数据源采样比例
+
+    【关键概念】
+    - shard_sampling_rate: 每个shard实际采样的比例（0-1），用于控制数据复用程度
+    - num_shards_to_sample: 每个epoch最多采样的shard数（防止无限迭代）
+    - seed: 控制shard采样顺序的随机性（resume时可重置）
     """
 
     def __init__(
@@ -1293,16 +1362,35 @@ class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
         allow_padding_at_end: bool = False,
     ):
         """
-        Initialize the mixture dataset.
+        初始化混合数据集。
 
         Args:
-            data_mixture (list[tuple[ShardedLeRobotSingleDataset, float]]): Datasets and their corresponding weights.
-            mode (str): If "train", __iter__ will yield different samples every epoch; if "val" or "test", __iter__ will yield the same sample every epoch.
-            balance_dataset_weights (bool): If True, the weight of dataset will be multiplied by the total trajectory length of each dataset.
-            balance_trajectory_weights (bool): If True, sample trajectories within a dataset weighted by their length; otherwise, use equal weighting.
-            seed (int): Random seed for sampling.
-            shard_sampling_rate (float): How much data per shard to sample, in a 0-1 scale.
-            num_shards_to_sample (int): The number of shards to sample.
+            data_mixture (list[tuple[LeRobotSingleDataset, float]]): 
+                数据集列表，每个元素为(dataset, weight)元组。
+                dataset: ShardedLeRobotSingleDataset（或其子类）实例。
+                weight: 该数据集的采样权重（原始权重，会被balance策略调整）。
+            training (bool): 是否训练模式。训练时随机采样shard；验证时确定性采样。
+            balance_dataset_weights (bool): 
+                是否按数据集总步数平衡权重。若为True，dataset_weight会乘以该数据集总步数。
+                这样大数据集（如DROID）会比小数据集（如YAM）采样更频繁。
+            balance_trajectory_weights (bool): 
+                是否在数据集内按trajectory长度加权。长trajectory被采样概率更高。
+            seed (int): 随机种子，控制shard采样顺序。resume training时可重置。
+            shard_sampling_rate (float): 
+                每个shard中实际采样的步数比例（0-1）。例如0.1表示每个shard只采10%的步。
+                用于控制数据复用和epoch概念（shard级partial sampling）。
+            num_shards_to_sample (int): 
+                每个epoch最多采样的shard数量（默认2^20，实际近似无限）。
+                控制虚拟epoch长度，方便wandb logging。
+            allow_padding_at_end (bool): 
+                当shard采样导致样本不足时，是否允许用最后一个样本padding。
+
+        【初始化流程】
+        1. 调用父类LeRobotMixtureDataset.__init__()处理data_mixture和基础权重
+        2. 收集所有数据集的shard信息，计算全局shard采样权重：
+           weight_shard = shard_length / sum(shard_lengths) × dataset_weight_normalized
+        3. 保存shard_sampling_rate和num_shards_to_sample
+        4. 初始化迭代器状态（_shard_iterator）
         """
         super().__init__(
             data_mixture=data_mixture,

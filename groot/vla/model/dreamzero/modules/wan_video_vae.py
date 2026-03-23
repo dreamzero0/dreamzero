@@ -1,3 +1,44 @@
+"""
+WanVideoVAE — 3D 因果卷积视频 VAE 模块。
+
+在 DreamZero 管线中属于 **Encoder 部分**（冻结），负责将视频像素空间映射到潜空间
+（编码），以及将潜空间映射回像素空间（解码，推理时使用）。
+
+架构层次:
+    WanVideoVAE (高层 API，处理 batch 和 tiling)
+    └── VideoVAE_ (底层模型)
+        ├── encoder: Encoder3d (3D 因果卷积下采样编码器)
+        │   ├── 多层 ResBlock + (可选) Attention
+        │   └── 时间下采样: [False, True, True] → 4× 时间压缩
+        ├── conv1: CausalConv3d(z_dim*2, z_dim*2, 1) — μ/σ 投影
+        ├── conv2: CausalConv3d(z_dim, z_dim, 1) — 解码前投影
+        └── decoder: Decoder3d (3D 因果卷积上采样解码器)
+
+下采样倍率:
+    - 空间: 8× (H/8, W/8) — 通过 3 次 stride=2 卷积
+    - 时间: 4× — 第一帧独立编码 + 后续每4帧压缩为1帧
+      T_lat = 1 + (T-1)//4
+
+潜空间:
+    z_dim=16 通道，经 channel-wise 标准化 (mean/std 预计算)
+
+数据流位置:
+    WANPolicyHead.encode_video(videos)
+        ↓
+    WanVideoVAE.encode(videos)  →  latents: (B, 16, T_lat, H_lat, W_lat)
+        ↓
+    FlowMatchScheduler.add_noise  →  noisy_latents
+        ↓
+    CausalWanModel patch_embed  →  视频 token 序列
+
+推理时:
+    CausalWanModel → video_noise_pred → FlowMatchScheduler.step 去噪 → latents
+        ↓
+    WanVideoVAE.decode(latents)  →  重建视频: (B, 3, T, H, W)
+
+预训练权重: Wan2.1_VAE.pth
+冻结状态: requires_grad=False，始终不训练；torch.no_grad() 下执行
+"""
 from einops import rearrange, repeat
 
 import torch
@@ -32,7 +73,16 @@ def block_causal_mask(x, block_size):
 
 class CausalConv3d(nn.Conv3d):
     """
-    Causal 3d convolusion.
+    因果 3D 卷积：时间维度上仅使用当前帧及之前帧的信息（不看未来帧）。
+
+    实现方式: 将时间维的 padding 全部放在前面（左侧），后面无 padding，
+    从而保证时间维度上的因果性。
+
+    Inputs:
+        x:       (B, C, T, H, W) — 输入特征图。
+        cache_x: (B, C, T_cache, H, W) 或 None — 前一个 chunk 的缓存（流式推理时使用）。
+    Output:
+        (B, C_out, T', H', W') — 卷积输出，时间维因果。
     """
 
     def __init__(self, *args, **kwargs):
@@ -937,6 +987,32 @@ def count_conv3d(model):
 
 
 class VideoVAE_(nn.Module):
+    """
+    底层视频 VAE 模型（Encoder3d + Decoder3d）。
+
+    作用:
+        encode: 将视频 (B, 3, T, H, W) 编码为潜变量 (B, z_dim, T_lat, H_lat, W_lat)，
+                使用确定性编码（取 μ，不采样）。
+        decode: 将潜变量解码回视频 (B, 3, T, H, W)。
+
+    编码流程:
+        1. Encoder3d 逐 chunk 因果编码（每次处理4帧，首帧独立）
+        2. conv1(out) → chunk(2, dim=1) → 取 μ（丢弃 log_var）
+        3. channel-wise 标准化: (μ - mean) / std
+
+    解码流程:
+        1. 反标准化: z / (1/std) + mean
+        2. conv2(z)
+        3. Decoder3d 逐帧因果解码
+
+    Inputs (encode):
+        x:     (B, 3, T, H, W) 或 (1, 3, T, H, W) — 视频像素 ∈ [-1, 1]。
+        scale: [mean, 1/std] — channel-wise 标准化参数。
+    Output (encode):
+        (B, z_dim, T_lat, H_lat, W_lat) — T_lat = 1+(T-1)//4, H_lat = H//8, W_lat = W//8。
+
+    被调用: WanVideoVAE.single_encode() / WanVideoVAE.tiled_encode()
+    """
 
     def __init__(self,
                  dim=96,
@@ -1038,6 +1114,39 @@ class VideoVAE_(nn.Module):
 
 
 class WanVideoVAE(nn.Module):
+    """
+    视频 VAE 高层封装（处理 batch 遍历和 tiling 策略）。
+
+    作用:
+        封装 VideoVAE_，提供 batch-level 的 encode/decode 接口，
+        支持 tiling（分块编解码，节省显存处理高分辨率视频）。
+
+    原理:
+        - encode: 遍历 batch 中每个视频，调用 single_encode 或 tiled_encode
+        - decode: 调用 single_decode 或 tiled_decode
+        - channel-wise 标准化参数（mean/std）预计算并存储为 self.scale
+
+    Inputs (encode):
+        videos:      (B, 3, T, H, W) — 归一化到 [-1, 1] 的视频。
+        tiled:       bool — 是否使用分块编码（高分辨率时节省显存）。
+        tile_size:   (int, int) — 分块的空间大小（潜空间单位）。
+        tile_stride:  (int, int) — 分块的步进。
+    Output (encode):
+        (B, 16, T_lat, H_lat, W_lat) — 视频潜变量。
+        T_lat = 1 + (T-1)//4, H_lat = H//8, W_lat = W//8
+
+    Inputs (decode):
+        hidden_states: (B, 16, T_lat, H_lat, W_lat) — 潜变量。
+    Output (decode):
+        (B, 3, T, H, W) — 重建视频 ∈ [-1, 1]。
+
+    上游: WANPolicyHead.encode_video() 调用 self.vae.encode()
+    下游 (encode): latents → FlowMatchScheduler.add_noise → CausalWanModel
+    下游 (decode): 推理时 CausalWanModel 去噪后的 latents → decode → 视频
+
+    预训练权重: Wan2.1_VAE.pth
+    冻结状态: requires_grad=False，self.model.eval()
+    """
 
     def __init__(self, z_dim=16, vae_pretrained_path: str | None = None):
         super().__init__()
@@ -1196,16 +1305,46 @@ class WanVideoVAE(nn.Module):
         return values
 
     def single_encode(self, video):
+        """
+        单视频编码（不分块）。
+
+        Args:
+            video: (1, 3, T, H, W) — 单个视频。
+        Returns:
+            (1, 16, T_lat, H_lat, W_lat) — 潜变量。
+        """
         x = self.model.encode(video, self.scale)
-        # The outputs of torch compile always need to be cloned before being used.
         x = x.clone()
         return x
 
     def single_decode(self, hidden_state):
+        """
+        单视频解码（不分块）。
+
+        Args:
+            hidden_state: (1, 16, T_lat, H_lat, W_lat) — 潜变量。
+        Returns:
+            (1, 3, T, H, W) — 重建视频 ∈ [-1, 1]。
+        """
         video = self.model.decode(hidden_state, self.scale)
         return video.clamp_(-1, 1)
 
     def encode(self, videos, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
+        """
+        将视频 batch 编码为潜变量。
+
+        Args:
+            videos:     (B, 3, T, H, W) — 输入视频，像素值 ∈ [-1, 1]。
+            tiled:      bool — 是否分块编码（高分辨率时节省显存）。
+            tile_size:  (int, int) — 潜空间中分块大小 (然后乘以 upsampling_factor=8 得到像素空间)。
+            tile_stride: (int, int) — 潜空间中分块步进。
+
+        Returns:
+            (B, 16, T_lat, H_lat, W_lat) — 标准化后的潜变量。
+            T_lat = 1 + (T-1)//4, H_lat = H//8, W_lat = W//8
+
+        被调用: WANPolicyHead.encode_video()
+        """
         hidden_states = []
         for video in videos:
             video = video.unsqueeze(0)
@@ -1221,6 +1360,20 @@ class WanVideoVAE(nn.Module):
         return hidden_states
 
     def decode(self, hidden_states, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
+        """
+        将潜变量解码为视频。
+
+        Args:
+            hidden_states: (B, 16, T_lat, H_lat, W_lat) — 潜变量。
+            tiled:         bool — 是否分块解码。
+            tile_size:     (int, int) — 潜空间中分块大小。
+            tile_stride:   (int, int) — 潜空间中分块步进。
+
+        Returns:
+            (B, 3, T, H, W) — 重建视频，像素值 clamp 到 [-1, 1]。
+
+        被调用: 推理时的视频重建流程。
+        """
         if tiled:
             video = self.tiled_decode(hidden_states, tile_size, tile_stride)
         else:

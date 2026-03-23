@@ -1,7 +1,31 @@
 """
-Concise re-implementation of
-``https://github.com/openai/CLIP'' and
-``https://github.com/mlfoundations/open_clip''.
+WanImageEncoder — CLIP ViT-H/14 图像编码器模块。
+
+精简复现自 OpenAI CLIP 和 Open-CLIP。
+在 DreamZero 管线中属于 **Encoder 部分**（冻结），负责将首帧图像编码为 CLIP 视觉特征，
+供 CausalWanModel 的交叉注意力（I2V 条件）使用。
+
+架构层次:
+    WanImageEncoder
+    └── model: XLMRobertaCLIP
+        └── visual: VisionTransformer (ViT-H/14)
+            ├── patch_embedding: Conv2d(3, 1280, kernel=14, stride=14)
+            ├── cls_embedding: (1, 1, 1280) — CLS token
+            ├── pos_embedding: (1, 257, 1280) — 位置嵌入 (1 CLS + 256 patches)
+            ├── pre_norm: LayerNorm(1280)
+            ├── transformer: 32 × AttentionBlock (自注意力 + FFN)
+            └── post_norm: LayerNorm(1280)
+
+数据流位置:
+    WANPolicyHead.encode_image(image)
+        ↓
+    WanImageEncoder.encode_image(videos)  →  (B, 257, 1280)
+        ↓
+    img_emb 投影 →  (B, 257, 5120) → 拼接到 context 中参与 DiT 交叉注意力
+
+典型维度 (ViT-H/14):
+    image_size=224, patch_size=14, vision_dim=1280, num_heads=16, num_layers=32
+    输出: (B, 1+16×16=257, 1280) — use_31_block=True 时取倒数第二层输出
 """
 import math
 import torch
@@ -384,6 +408,31 @@ class AttentionPool(nn.Module):
 
 
 class VisionTransformer(nn.Module):
+    """
+    CLIP 视觉 Transformer (ViT)。
+
+    作用: 将图像编码为 patch-level 的特征序列（可选带 CLS token 池化输出）。
+    在 DreamZero 中作为 CLIP 图像编码器的核心视觉子网络。
+
+    结构:
+        1. Patch Embedding: Conv2d(3, dim, kernel=patch_size, stride=patch_size)
+        2. CLS token 拼接 + 位置嵌入
+        3. (可选) Pre-Norm
+        4. N 层 AttentionBlock (自注意力 + FFN)
+        5. Post-Norm
+        6. Head (pool_type='token' 时为线性投影)
+
+    Inputs (forward):
+        x:             (B, 3, H, W) — 输入图像，已做 CLIP 归一化。
+        interpolation: bool — 是否对位置嵌入做双三次插值（分辨率不匹配时）。
+        use_31_block:  bool — True 时只过前 N-1 层（取倒数第二层输出），
+                       返回 (B, 1+num_patches, dim) 的完整 token 序列。
+    Output:
+        use_31_block=True:  (B, 257, 1280) — CLS + 256 patch tokens（ViT-H/14 @224）。
+        use_31_block=False: 经过全部层 + head 后的输出。
+
+    被调用: WanImageEncoder.encode_image() → self.model.visual(videos, use_31_block=True)
+    """
 
     def __init__(self,
                  image_size=224,
@@ -644,6 +693,15 @@ class XLMRobertaWithHead(XLMRoberta):
 
 
 class XLMRobertaCLIP(nn.Module):
+    """
+    XLM-Roberta 配对的 CLIP 模型（视觉+文本双塔）。
+
+    在 DreamZero 中仅使用 **视觉塔** (self.visual: VisionTransformer)。
+    文本塔 (self.textual) 设为 None，因为文本编码由独立的 WanTextEncoder (T5) 负责。
+
+    视觉塔参数 (ViT-H/14):
+        vision_dim=1280, vision_heads=16, vision_layers=32, patch_size=14, image_size=224
+    """
 
     def __init__(self,
                  embed_dim=1024,
@@ -827,6 +885,15 @@ def clip_xlm_roberta_vit_h_14(
         pretrained=False,
         pretrained_name='open-clip-xlm-roberta-large-vit-huge-14',
         **kwargs):
+    """
+    构建 XLMRobertaCLIP (ViT-H/14) 模型实例的工厂函数。
+
+    被调用: WanImageEncoder.__init__() 中初始化 self.model 和 self.transforms。
+
+    Returns:
+        model: XLMRobertaCLIP — 仅使用 model.visual (VisionTransformer)。
+        transforms: CLIP 图像预处理 (Resize + ToTensor + Normalize)。
+    """
     cfg = dict(
         embed_dim=1024,
         image_size=224,
@@ -854,6 +921,30 @@ def clip_xlm_roberta_vit_h_14(
 
 
 class WanImageEncoder(torch.nn.Module):
+    """
+    CLIP ViT-H/14 图像编码器（XLM-Roberta-Large 配对版本）。
+
+    作用:
+        将首帧图像编码为 CLIP 视觉特征，用于 I2V（Image-to-Video）条件生成。
+        在 DreamZero 中属于 **Encoder 部分**，始终冻结（requires_grad=False）。
+
+    原理:
+        1. 预处理：将输入图像从 [-1,1] 缩放到 [0,1]，然后做 CLIP 归一化
+           (mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
+        2. Resize 到 224×224
+        3. 通过 ViT-H/14 的前 31 层（`use_31_block=True`），输出倒数第二层的 token 序列
+
+    Inputs (encode_image):
+        videos: (B, 3, H, W) — 首帧图像，像素值在 [-1, 1] 范围。
+    Output:
+        (B, 257, 1280) — 1 个 CLS token + 256 个 patch tokens 的视觉特征。
+
+    上游: WANPolicyHead.encode_image(image) 中从 videos[:, :, :1] 提取首帧
+    下游: img_emb 投影到 (B, 257, 5120) → 拼接到 context 中参与 CausalWanModel 交叉注意力
+
+    预训练权重: models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth
+    冻结状态: requires_grad=False，始终不训练
+    """
 
     def __init__(self, image_encoder_pretrained_path: str=None):
         super().__init__()
@@ -867,7 +958,22 @@ class WanImageEncoder(torch.nn.Module):
         self.image_encoder_pretrained_path = image_encoder_pretrained_path
 
     def encode_image(self, videos):
-        # preprocess
+        """
+        将首帧图像编码为 CLIP 视觉 token 序列。
+
+        Args:
+            videos: (B, 3, H, W) — 首帧图像，像素值 ∈ [-1, 1]。
+
+        Returns:
+            (B, 257, 1280) — CLS token + 256 patch tokens 的 ViT-H/14 倒数第二层输出。
+
+        处理流程:
+            1. bicubic 插值到 (B, 3, 224, 224)
+            2. [-1,1] → [0,1] → CLIP 归一化
+            3. ViT-H/14 前向（use_31_block=True，取前31层输出）
+
+        被调用: WANPolicyHead.encode_image()
+        """
         size = (self.model.image_size,) * 2
         videos = torch.cat([
             F.interpolate(
@@ -877,12 +983,9 @@ class WanImageEncoder(torch.nn.Module):
                 align_corners=False) for u in videos
         ])
         videos = self.transforms.transforms[-1](videos.mul_(0.5).add_(0.5))
-
-        # forward
         dtype = next(iter(self.model.visual.parameters())).dtype
         videos = videos.to(dtype)
         out = self.model.visual(videos, use_31_block=True)
-        # The outputs of torch compile always need to be cloned before being used.
         out = out.clone()
         return out
         
