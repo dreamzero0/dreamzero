@@ -16,6 +16,7 @@
 # This file is modified from https://github.com/haotian-liu/LLaVA/
 
 from abc import ABC
+from collections import defaultdict
 import contextlib
 import json
 import logging
@@ -32,7 +33,7 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf, open_dict
 import torch
 from torch.profiler import ProfilerActivity, profile
-from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data import DataLoader, Dataset, IterableDataset, Sampler
 import transformers
 from transformers import TrainerCallback, set_seed
 from transformers.trainer import (
@@ -317,6 +318,32 @@ class BaseSampler(Sampler):
         return len(self.data_source)
 
 
+class BucketedIterableWrapper(IterableDataset):
+    """Yields samples in blocks of batch_size with identical n_chunks so DataLoader
+    assembles homogeneous batches without shape conflicts in collate.
+    Requires num_workers=0 (each worker would otherwise see the full stream independently).
+    """
+
+    def __init__(self, dataset, batch_size: int, key: str = "n_chunks"):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.key = key
+
+    def __iter__(self):
+        buckets = defaultdict(list)
+        for sample in self.dataset:
+            k = sample.get(self.key, 1)
+            buckets[k].append(sample)
+            while len(buckets[k]) >= self.batch_size:
+                yield from buckets[k][: self.batch_size]
+                buckets[k] = buckets[k][self.batch_size :]
+        for k in sorted(buckets.keys()):
+            yield from buckets[k]
+
+    def __len__(self):
+        return len(self.dataset)
+
+
 class BaseTrainer(transformers.Trainer):
 
     def __init__(self, **kwargs):
@@ -563,6 +590,11 @@ class BaseTrainer(transformers.Trainer):
             )
 
         print("Creating custom train dataloader")
+        # Bucket samples by n_chunks so every batch is shape-homogeneous (avoids collate errors
+        # when variable-length trajectories produce different action/video/state tensor sizes).
+        # Skip bucketing for BS=1: every batch is a single sample so there is no shape conflict.
+        if self._train_batch_size > 1:
+            train_dataset = BucketedIterableWrapper(train_dataset, batch_size=self._train_batch_size)
         # Handle the case where the dataset is an IterableDataset
         data_collator = self.data_collator
         data_collator = self._get_collator_with_removed_columns(

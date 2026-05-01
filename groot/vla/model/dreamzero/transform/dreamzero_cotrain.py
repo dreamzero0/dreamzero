@@ -94,6 +94,8 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
     keys = features[0].keys()
 
     for key in keys:
+        if key == 'n_chunks':
+            continue
         if key == "text":
             output_values = []
             for elem in features:
@@ -160,7 +162,11 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
             batch['text_attention_mask_negative'] = mask
         else:
             values = [elem[key] for elem in features]
-            batch[key] = torch.from_numpy(np.stack(values))
+            try:
+                batch[key] = torch.from_numpy(np.stack(values))
+            except ValueError as e:
+                shapes = [getattr(v, 'shape', type(v)) for v in values]
+                raise ValueError(f"collate key={key!r}: {e}. Shapes: {shapes}") from e
     return batch
 
 
@@ -314,7 +320,7 @@ class DreamTransform(InvertibleModalityTransform):
         )
         if images.shape[0] > 1:
             v, t, c, h, w = images.shape
-            
+
             # For DROID embodiment: 2x2 grid where the wrist view spans the full top row,
             # and the two exterior views occupy the bottom row.
             #
@@ -353,14 +359,14 @@ class DreamTransform(InvertibleModalityTransform):
                 concat_images[0, :, :, h:, w:] = right_exterior
 
                 return concat_images
-            
+
             # For other embodiments: use 2x2 grid layout
             # Layout: [head, right]
             #         [left, black]
-            
+
             # Create output tensor with doubled height and width
             concat_images = np.zeros((1, t, c, 2*h, 2*w), dtype=images.dtype)
-            
+
             # Place images in the 2x2 grid
             # Left upper: head image (view 0)
             if v > 0:
@@ -377,7 +383,7 @@ class DreamTransform(InvertibleModalityTransform):
             # Right bottom: black pixels (already zeros from initialization)
 
             return concat_images
-        
+
         return images
 
     def _prepare_language(self, data: dict):
@@ -468,7 +474,6 @@ class DreamTransform(InvertibleModalityTransform):
         state_mask = np.zeros_like(state).astype(bool)
         state_mask[:, :n_state_dims] = True
 
-        # We only have 1 "proprio" token to represent the entire state
         n_state_tokens = state.shape[0]
         return state, state_mask, n_state_tokens
 
@@ -598,6 +603,11 @@ class DreamTransform(InvertibleModalityTransform):
                 transformed_data[key].shape == transformed_data["action"].shape
                 for key in action_and_mask_keys
             ), f"Shape mismatch: {[(key, transformed_data[key].shape) for key in action_and_mask_keys]}"
+
+        if "action" in transformed_data:
+            transformed_data["n_chunks"] = int(transformed_data["action"].shape[0] // self.action_horizon)
+        else:
+            transformed_data["n_chunks"] = 1
 
         return transformed_data
 
