@@ -544,7 +544,7 @@ class WANPolicyHead(ActionHead):
         prompt_emb = self.text_encoder(input_ids, attention_mask)
         prompt_emb = prompt_emb.clone().to(dtype=torch.bfloat16)
         for i, v in enumerate(seq_lens):
-            prompt_emb[:, v:] = 0
+            prompt_emb[i, v:] = 0
         return prompt_emb
 
     def _ensure_vae_on_device(self, ref_tensor):
