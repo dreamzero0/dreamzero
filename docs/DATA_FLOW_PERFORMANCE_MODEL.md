@@ -1,0 +1,543 @@
+# DreamZero 训练数据流性能建模
+
+> 模型：Wan2.1-I2V-14B (~16.5B 参数) | LoRA rank=4 | FSDP full_shard × 8 NPU
+> 配置：num_frames=33, action_horizon=24, num_views=3, resolution=176×320
+> DiT：40 layers, dim=5120, num_heads=40, head_dim=128, ffn_dim=13824
+> VAE：z_dim=16, spatial 8×↓, temporal 4×↓
+
+---
+
+## 总览：端到端数据流
+
+> **关键架构说明**：3 个相机视角（256×480 each）在 DreamTransform 中被拼接为 2×2 网格（512×960），
+> 然后在模型 forward 中 resize 到 176×320 再送入 VAE。DiT 看到的 token 来自这个包含 3 视角的合成图像。
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                    DROID Dataset (parquet + MP4)                          │
+│  Video ×3 views: (T_vid, ~256, ~480, 3) uint8, MP4 decoded              │
+│  Action: (T_action, 8) float64      State: (T_state, 8) float64         │
+│  Language: text strings (3 variants)                                     │
+│  T_vid = 8n+1 (9~41), T_action = 24m (24~120), T_state = 1~5 anchors   │
+└───────────────┬──────────────────────────────────────────────────────────┘
+                │ Per-sample: video ~5-15 MB raw (varies by T_vid)
+                ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Stage 0: DreamTransform — Grid Composition (CPU)                        │
+│  • 3 views → 2×2 composite grid:                                         │
+│    [ wrist(×2 wide) | wrist(×2 wide) ]  top row (480×2=960)             │
+│    [ exterior_left  | exterior_right  ]  bottom row                      │
+│  • Total grid: (T_vid, 512, 960, 3) uint8                               │
+│  • Resize/Crop to (T_vid, 256, 480, 3) then compose                      │
+│  • State padded to (T_state, 44) float64, Action padded to (T, 32)      │
+│                                                                          │
+│  Output: video (B, T, 512, 960, 3) uint8    State (B, T_s, 44) float64  │
+│          action (B, T_a, 32) float64         Text token ids (B, 512)     │
+└───────────────┬──────────────────────────────────────────────────────────┘
+                │
+                ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Stage 1: Model Forward — Video Preprocessing (NPU)                      │
+│  • rearrange: (B, T, 512, 960, 3) → (B, 3, T, 512, 960)                │
+│  • uint8 → float32 / 255 → Normalize(0.5, 0.5) → bf16                   │
+│  • Resize to target: interpolate((B, 3, T, 512, 960) → (B, 3, 33, 176, 320))│
+│  • T is trimmed/padded to exactly 33 frames                              │
+│                                                                          │
+│  Output: video (B, 3, 33, 176, 320) bf16  ≈ 11.2 MB                     │
+│          action (B, 24, 7) bf16             ≈ 336 B                      │
+│          state  (B, 1, 7) bf16              ≈ 14 B                       │
+│          text   (B, 512) int64              ≈ 4 KB                       │
+│                                                                          │
+│  注：B = batch_size=1（合成网格含 3 视角），effective 单步样本数 = 8     │
+└───────────────┬──────────────────────────────────────────────────────────┘
+                │
+                ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Stage 2: VAE Encode (NPU, frozen, no_grad)                              │
+│  • Spatial: 176×320 → 22×40  (8×↓)                                      │
+│  • Temporal: 33 → 9          (4×↓, padded to 36 then /4)                │
+│  • Channel: 3 → 16           (z_dim)                                     │
+│                                                                          │
+│  Input:  (B, 3,  33, 176, 320) bf16 ≈ 11.2 MB                           │
+│  Output: (B, 16, 9,  22,  40)  bf16 ≈ 0.62 MB (18× compression)         │
+└───────────────┬──────────────────────────────────────────────────────────┘
+                │
+                ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Stage 3: CLIP + T5 Encode (NPU, frozen, no_grad)                       │
+│                                                                          │
+│  CLIP (first frame → image condition):                                   │
+│    Input:  first frame (B, 3, 176, 320) bf16                             │
+│    Output: (B, 257, 1280) → MLPProj → (B, 257, 5120) ≈ 2.6 MB           │
+│                                                                          │
+│  T5 (language instruction):                                              │
+│    Input:  token ids (B, 512) int64                                      │
+│    Output: (B, 512, 4096) → text_emb → (B, 512, 5120) ≈ 5.2 MB          │
+│                                                                          │
+│  First Frame Condition y (via VAE):                                      │
+│    VAE([first_frame, zeros(32frames)]) → (B, 16, 9, 22, 40)             │
+│    + mask(4) → (B, 20, 9, 22, 40) bf16                       ≈ 0.76 MB  │
+└───────────────┬──────────────────────────────────────────────────────────┘
+                │
+                ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Stage 4: Flow Matching Noise (NPU)                                      │
+│  • σ ~ Beta(3,1) or Uniform(0,1000)                                     │
+│  • z_noisy = (1-σ)·z_0 + σ·ε                                            │
+│  • target = ε - z_0                                                      │
+│                                                                          │
+│  noise:          (B, 16, 9, 22, 40) bf16     ≈ 0.62 MB                  │
+│  noisy_latents:  (B, 16, 9, 22, 40) bf16     ≈ 0.62 MB                  │
+│  training_target:(B, 16, 9, 22, 40) bf16     ≈ 0.62 MB                  │
+│  noise_action:   (B, 24, 7) bf16             ≈ 336 B                     │
+│  noisy_actions:  (B, 24, 7) bf16             ≈ 336 B                     │
+│  target_action:  (B, 24, 7) bf16             ≈ 336 B                     │
+└───────────────┬──────────────────────────────────────────────────────────┘
+                │
+                ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Stage 5: Patch Embedding (NPU)                                          │
+│  • Concat [x(16ch), y(20ch)] → 36ch input                               │
+│  • Conv3d(36→5120, kernel=(1,2,2), stride=(1,2,2))                      │
+│                                                                          │
+│  Input concat:  (B, 36, 9, 22, 40) bf16      ≈ 1.36 MB                  │
+│  After embed:   (B, 5120, 9, 11, 20) bf16    ≈ 19.3 MB                  │
+│  Flatten:       (B, 1980, 5120) bf16          ≈ 19.3 MB                  │
+│  (tokens_per_frame = 11×20 = 220, seq_len = 9×220 = 1980)               │
+└───────────────┬──────────────────────────────────────────────────────────┘
+                │
+                ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Stage 6: Token Assembly — Teacher Forcing (NPU)                         │
+│                                                                          │
+│  clean_x tokens:   1980 tokens × 5120 dim  ≈ 19.3 MB (bf16)             │
+│  noisy_x tokens:   1980 tokens × 5120 dim  ≈ 19.3 MB (bf16)             │
+│  action_register:  24 tokens × 5120 dim     ≈ 0.24 MB (bf16)            │
+│  state_register:   1 token × 5120 dim       ≈ 10 KB  (bf16)             │
+│  ─────────────────────────────────────────────────                       │
+│  Total sequence:   3985 tokens × 5120 dim   ≈ 38.9 MB (bf16)            │
+│                                                                          │
+│  Context (cross-attn):                                                   │
+│  CLIP:  257 tokens × 5120 dim  ≈ 2.6 MB                                 │
+│  T5:    512 tokens × 5120 dim  ≈ 5.2 MB                                 │
+│  Total context: 769 tokens      ≈ 7.9 MB                                │
+└───────────────┬─────────────────────────────────────────────────────────┘
+                │
+                ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Stage 7: DiT × 40 Layers (NPU, FSDP wrapped)                            │
+│                                                                          │
+│  Per layer operations (for each of 40 CausalWanAttentionBlocks):         │
+│                                                                          │
+│  ┌─ SelfAttention ─────────────────────────────────────────────────┐    │
+│  │  Q/K/V: Linear(5120→5120) × 3 → (B, 3985, 40, 128) bf16      │    │
+│  │  RoPE: 3D (video), 1D (action/state), complex→real on NPU       │    │
+│  │  Causal mask: blockwise (2 frames/block)                        │    │
+│  │  SDPA: Q×K^T → (B, 40, 3985, ≤3985) × V                     │    │
+│  │  Output: Linear(5120→5120) → (B, 3985, 5120)                 │    │
+│  │  Data accessed: ~122 MB read, ~41 MB write (bf16)              │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  ┌─ CrossAttention (I2V, 2 branches) ───────────────────────────────┐   │
+│  │  Branch 1: Q(video,3985) × K,V(CLIP,257) → (B, 3985, 5120)    │   │
+│  │  Branch 2: Q(video,3985) × K,V(T5,512)   → (B, 3985, 5120)    │   │
+│  │  Data accessed: ~49 MB read, ~41 MB write                        │   │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  ┌─ FFN + AdaLN ───────────────────────────────────────────────────┐    │
+│  │  RMS Norm → Linear(5120→13824) → GELU → Linear(13824→5120)      │    │
+│  │  AdaLN: time-modulated shift/scale/gate (6 params × 5120)       │    │
+│  │  Data accessed: ~163 MB read, ~41 MB write                      │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  Per-layer total data movement (read+write): ~457 MB                     │
+│  40 layers total: ~18.3 GB (logical, before gradient checkpointing)      │
+└───────────────┬─────────────────────────────────────────────────────────┘
+                │
+                ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Stage 8: Head + Unpatchify (NPU)                                        │
+│  • Extract x[:, :1980] → (B, 1980, 5120)                              │
+│  • CausalHead: Linear(5120→64) → (B, 1980, 64)                        │
+│  • Unpatchify: (B, 1980, 64) → (B, 16, 9, 22, 40)                  │
+│  • video_noise_pred: (B, 16, 9, 22, 40) bf16      ≈ 1.2 MB            │
+│                                                                          │
+│  • Extract x[:, 1980:2004] → (B, 24, 5120)                            │
+│  • Action Decoder: MLP(5120→1024→64→7) → (B, 24, 7)                  │
+│  • action_noise_pred: (B, 24, 7) bf16             ≈ 1.0 KB            │
+└───────────────┬─────────────────────────────────────────────────────────┘
+                │
+                ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Stage 9: Loss Computation (NPU)                                         │
+│  • L_dynamics = weighted_MSE(v_pred, target) per sample                 │
+│  • L_action = weighted_MSE(a_pred, target_a) × action_mask              │
+│  • L_total = L_dynamics + L_action                                      │
+│  • Backward: gradient flows through DiT → LoRA params only              │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 一、各阶段详细数据量
+
+### 1.1 原始数据集 (per sample, before batching)
+
+| 模态 | 形状 | 数据类型 | 字节数 | 备注 |
+|------|------|----------|--------|------|
+| Video ×3 views | (25, 176, 320, 3) × 3 | uint8 | ~12.7 MB | MP4 解码后原始帧 |
+| Action | (24, 7) | float32 | 672 B | 7-DoF 绝对位置 |
+| State | (1, 7) | float32 | 28 B | joint pos(6) + gripper(1) |
+| Language | variable (≤512 tokens) | string | ~200 B | 任务指令文本 |
+
+> **注**：数据集存储为 parquet + MP4，网络传输量取决于 chunk 大小和压缩率。MP4 压缩率约 30-50×（12.7 MB → ~300 KB）。
+
+### 1.2 Data Transforms 后 (per sample on CPU, before moving to NPU)
+
+| 模态 | 形状 | 数据类型 | 字节数 |
+|------|------|----------|--------|
+| Video (rearranged) | (3, 33, 176, 320) | bf16 | ~11.2 MB |
+| Video ×3 views | (3, 3, 33, 176, 320) | bf16 | ~33.5 MB |
+| Action (relative) | (24, 7) | float32→bf16 | 336 B |
+| State | (4, 7) | float32→bf16 | 56 B |
+| Text tokens | (512,) | int64 | 4 KB |
+
+### 1.3 VAE Encode 后 (on NPU, per grid sample)
+
+| 模态 | 形状 | 数据类型 | 字节数 |
+|------|------|----------|--------|
+| Latents z_0 | (B, 16, 9, 22, 40) | bf16 | 0.62 MB |
+| First frame condition y | (B, 20, 9, 22, 40) | bf16 | 0.76 MB |
+
+**压缩比计算：**
+- VAE input (grid): 3 × 33 × 176 × 320 = 5,575,680 像素 × 2 bytes (bf16) = 11.15 MB
+- VAE output: 16 × 9 × 22 × 40 = 126,720 元素 × 2 bytes = 0.25 MB → **45× 压缩**
+- 含 context (CLIP+T5): ~11.2 + ~0.6 + ~5 = ~16.8 MB → ~2.0 MB latent+context → **~8.4× 总压缩**
+
+### 1.4 CLIP + T5 Encode 后 (per grid sample)
+
+| 模态 | 形状 | 数据类型 | 字节数 |
+|------|------|----------|--------|
+| CLIP features | (B, 257, 1280) | bf16 | 0.63 MB |
+| After MLPProj | (B, 257, 5120) | bf16 | 2.63 MB |
+| T5 embeddings (raw) | (B, 512, 4096) | bf16 | 4.00 MB |
+| After text_emb | (B, 512, 5120) | bf16 | 5.00 MB |
+
+### 1.5 Patch Embedding 后 (per grid sample)
+
+| 步骤 | 形状 | 数据类型 | 字节数 |
+|------|------|----------|--------|
+| Concat [x(16), y(20)] | (B, 36, 9, 22, 40) | bf16 | 1.36 MB |
+| After Conv3d | (B, 5120, 9, 11, 20) | bf16 | 19.34 MB |
+| Flatten (per branch) | (B, 1980, 5120) | bf16 | 19.34 MB |
+
+> tokens_per_frame = (176/8)/2 × (320/8)/2 = 11 × 20 = **220**  
+> seq_len = 9 × 220 = **1980** (per branch: clean or noisy)
+
+### 1.6 完整 DiT 输入 Token 序列
+
+| 组成部分 | Token 数 | Dim | 字节数 (bf16) |
+|----------|----------|-----|---------------|
+| Clean video tokens | 1,980 | 5,120 | 19.34 MB |
+| Noisy video tokens | 1,980 | 5,120 | 19.34 MB |
+| Action register | 24 | 5,120 | 0.24 MB |
+| State register | 1 | 5,120 | 0.01 MB |
+| **主序列总计** | **3,985** | **5,120** | **38.92 MB** |
+| | | | |
+| CLIP context (cross-attn) | 257 | 5,120 | 2.63 MB |
+| T5 context (cross-attn) | 512 | 5,120 | 5.00 MB |
+| **Context 总计** | **769** | **5,120** | **7.63 MB** |
+
+---
+
+## 二、DiT 单层数据运动量
+
+### 2.1 SelfAttention（主序列 3985 tokens）
+
+| 操作 | 计算 | 数据量 (bf16) |
+|------|------|---------------|
+| Q = Linear(5120→5120)(x) | 权重: 5120×5120 | 50 MB param, 78 MB act |
+| K = Linear(5120→5120)(x) | 同上 | 50 MB param, 78 MB act |
+| V = Linear(5120→5120)(x) | 同上 | 50 MB param, 78 MB act |
+| RoPE apply | Q, K in-place 变换 | — |
+| SDPA: Q×K^T | (B, 40, 3985, max_attn) | ~2.6 GB FLOPs, ~6 MB attn matrix |
+| SDPA: ×V | (B, 40, 3985, 128) | — |
+| O = Linear(5120→5120) | 权重: 5120×5120 | 50 MB param, 78 MB act |
+
+**SelfAttention 数据运动合计（per layer）：**
+- 参数读取 (LoRA): 4 × (5120×4 + 4×5120) × 2 bytes ≈ 328 KB (LoRA only, base frozen)
+- 参数读取 (base, FSDP all-gather): 4 × 5120×5120 × 2 bytes / 8 cards = **25 MB**（all-gather 到每卡）
+- 激活值: Q/K/V/O 各 ~78 MB (rw) = **~312 MB**
+- **总计 per layer**: ~337 MB
+
+### 2.2 CrossAttention（2 branches: CLIP 257 + T5 512）
+
+| 操作 | 数据量 |
+|------|--------|
+| Q from main seq (3985) | 78 MB |
+| K,V from CLIP (257) | 2 × 2.63 MB = 5.26 MB |
+| K,V from T5 (512) | 2 × 5.00 MB = 10.00 MB |
+| Output projection ×2 | 78 MB × 2 = 156 MB |
+| **总计 per layer** | ~249 MB |
+
+### 2.3 FFN + AdaLN
+
+| 操作 | 计算 | 数据量 |
+|------|------|--------|
+| RMS Norm | (B, 3985, 5120) | 78 MB |
+| Linear 5120→13824 | 权重: 5120×13824 | 141 MB param, 211 MB act |
+| GELU | element-wise | — |
+| Linear 13824→5120 | 权重: 13824×5120 | 141 MB param, 78 MB act |
+| AdaLN modulation | 6 × 5120 | 120 KB |
+| **总计 per layer** | | ~649 MB |
+
+> **注**：以上为逻辑数据量。由于 FSDP `full_shard`，基座参数分布在 8 张卡上，每卡只需 all-gather 1/8 的参数。LoRA 参数 (bf16) 完全复制在每张卡上。
+
+### 2.4 单层 DiT Block 汇总
+
+| 组件 | 逻辑数据运动 | FSDP 均摊后（per card） |
+|------|-------------|------------------------|
+| SelfAttention | ~337 MB | ~160 MB |
+| CrossAttention | ~249 MB | ~200 MB (context 不 shard) |
+| FFN + AdaLN | ~649 MB | ~375 MB |
+| **单层合计** | **~1.24 GB** | **~735 MB** |
+| **40 层合计** | **~49.6 GB** | **~29.4 GB** |
+
+---
+
+## 三、FSDP 通信模式
+
+### 3.1 FSDP 单元配置
+
+| 参数 | 值 |
+|------|-----|
+| 总 DiT 参数 | ~14B (不含 T5/CLIP/VAE) |
+| FSDP 单元 | 40 × CausalWanAttentionBlock + 1 × patch_embedding |
+| 每单元参数（均值） | ~350M |
+| 每单元大小 (bf16) | ~700 MB |
+| 每卡分片 (8 NPU) | ~87.5 MB per unit |
+
+### 3.2 All-Gather 通信（Forward）
+
+每次 forward 经过一个 FSDP 单元时：
+1. All-gather: 7 张卡各送 ~87.5 MB → 每卡收 ~612.5 MB（凑齐完整参数）
+2. 该卡用完整参数计算 forward
+3. 释放 all-gathered 副本（或保留到 backward）
+
+**Per layer per step:**
+- All-gather 发送: 87.5 MB (per card)
+- All-gather 接收: 612.5 MB (per card)
+- 40 layers + embedding: 41 × 87.5 MB sent = 3.59 GB sent per card per step
+- 41 × 612.5 MB received = 25.1 GB received per card per step
+
+### 3.3 Reduce-Scatter 通信（Backward）
+
+Backward 计算完梯度后：
+1. Reduce-scatter: 梯度均摊回各卡
+2. 每卡发送 ~612.5 MB, 保留 ~87.5 MB 分片
+
+**Per step backward:**
+- 发送: ~25.1 GB per card
+- 接收: ~25.1 GB per card
+
+### 3.4 总 HCCL 通信量 (per training step, per card)
+
+| 方向 | Forward (all-gather) | Backward (reduce-scatter) | 合计 |
+|------|---------------------|--------------------------|------|
+| Send | 3.59 GB | 25.1 GB | **28.7 GB** |
+| Recv | 25.1 GB | 25.1 GB | **50.2 GB** |
+| **双向总计** | | | **~78.9 GB** |
+
+> HCCL (Huawei Collective Communication Library) 基于 HCCS (Huawei Cache Coherence System) 互联，理论带宽约 56-100 GB/s per link。16 卡场景下双向通信时间约 1-3 秒。
+
+---
+
+## 四、梯度检查点 (Gradient Checkpointing)
+
+### 4.1 激活值内存
+
+| 场景 | 保存内容 | 激活内存 (per card) |
+|------|----------|---------------------|
+| 无 checkpoint | 全部 40 层中间激活 | ~15-20 GB |
+| Checkpoint (use_reentrant=True) | 仅 checkpoint 边界 | ~3-5 GB |
+
+**当前配置**: `use_reentrant=True`，每层 re-compute forward。实际：forward 跑两遍（第一遍不存中间值，backward 时重新 forward），所以 compute 翻倍但内存大幅降低。
+
+### 4.2 Recompute 开销
+
+- Forward pass: 1× (正常 forward)
+- Backward pass: 每层重新 forward + backward: 1× + 1× = 2×
+- **总 compute**: 3× forward + 1× backward = ~4× 纯 forward
+
+---
+
+## 五、LoRA 可训练参数
+
+### 5.1 LoRA 配置
+
+| 参数 | 值 |
+|------|-----|
+| Rank | 4 |
+| Alpha | 4 |
+| 目标模块 | q, k, v, o, ffn.0, ffn.2 |
+| 注入层数 | 40 layers × 6 modules = 240 LoRA pairs |
+
+### 5.2 参数量计算
+
+**SelfAttention (q, k, v, o)：**
+- Per layer: 4 × (5120×4 + 4×5120) = 4 × 40,960 = 163,840
+- 40 layers: 6,553,600
+
+**FFN (ffn.0, ffn.2)：**
+- ffn.0: (5120×4 + 4×13824) = 20,480 + 55,296 = 75,776
+- ffn.2: (13824×4 + 4×5120) = 55,296 + 20,480 = 75,776
+- Per layer: 151,552
+- 40 layers: 6,062,080
+
+**LoRA 参数合计**: ~12.6M (bf16) ≈ **25.2 MB**
+
+加上 Action Encoder (~62M)、State Encoder (~0.5M)、Action Decoder (~11M)：
+**总可训练参数**: ~86.1M → bf16 下 **~172 MB**（所有卡完全复制）
+优化器状态 (AdamW, fp32): ~172 × 3 = **~516 MB per card**
+
+---
+
+## 六、GPU 显存占用分解 (per NPU card, 61.28 GiB total)
+
+| 组件 | 大小 | 备注 |
+|------|------|------|
+| DiT 参数分片 (14B / 8) | ~3.5 GB | bf16, FSDP sharded |
+| LoRA 参数 | ~25 MB | bf16, 完全复制 |
+| LoRA 梯度 | ~50 MB | fp32 (bf16 params × 2) |
+| LoRA 优化器状态 | ~150 MB | fp32 × 3 (AdamW momenta) |
+| 其他可训练参数 | ~147 MB | bf16 |
+| 其他可训练梯度 | ~294 MB | fp32 |
+| 其他可训练优化器 | ~882 MB | fp32 × 3 |
+| All-gather buffer (peak 2 layers) | ~1.4 GB | 2 × 700 MB, bf16 |
+| 激活值 (gradient checkpoint) | ~4 GB | 含 clean+noisy token seq |
+| CLIP/T5/VAE (CPU offloaded) | 0 | 编码后释放 |
+| **总计** | **~10.5 GB** | |
+| **利用率** | **~17%** | 61.28 GB / 10.5 GB |
+
+> 实测 (v40 smoke test): Forward baseline 15.70 GB, backward peak ~19.46 GB。剩余空间可用于增大 batch size。
+
+---
+
+## 七、端到端吞吐量分析
+
+### 7.1 每步数据流汇总
+
+| 阶段 | 数据量 | 方向 | 位置 |
+|------|--------|------|------|
+| 数据加载 (per sample) | ~13.9 MB raw → ~35 MB transformed | CPU→CPU | CPU |
+| CPU→NPU 传输 (video) | ~33.5 MB | PCIe | 跨总线 |
+| VAE encode | 33.5 MB → 1.21 MB | NPU internal | HBM |
+| CLIP encode | ~0.67 MB → ~0.63 MB | NPU internal | HBM |
+| T5 encode | ~4 KB → ~4 MB | NPU internal | HBM |
+| Patch embedding | 2.7 MB → 38.7 MB (×2) | NPU internal | HBM |
+| FSDP all-gather (fwd) | 3.6 GB send, 25.1 GB recv | HCCL | 跨卡 |
+| DiT forward (40 layers) | ~29.4 GB data moved | NPU internal | HBM |
+| Loss + backward | compute + gradient flow | NPU+HCCL | HBM+跨卡 |
+| FSDP reduce-scatter (bwd) | 25.1 GB send+recv | HCCL | 跨卡 |
+| Optimizer step | ~172 MB params updated | NPU internal | HBM |
+
+### 7.2 时间分解 (实测 ~32s/step, 8 NPU)
+
+| 阶段 | 估算时间 | 瓶颈 |
+|------|----------|------|
+| 数据加载 + transforms | ~2-3s | CPU, disk I/O |
+| VAE/CLIP/T5 encode | ~3-5s | NPU compute |
+| DiT forward (40 layers) | ~8-10s | NPU compute + HCCL |
+| DiT backward + gradient checkpoint | ~12-15s | NPU compute + HCCL |
+| HCCL all-gather + reduce-scatter | ~2-3s | 跨卡带宽 |
+| Optimizer step | ~0.5-1s | NPU compute |
+| **总计** | **~32s** | |
+
+### 7.3 HCCL 带宽利用率
+
+- Per step 双向总通信: ~78.9 GB
+- 假设 HCCS 有效带宽: ~50 GB/s (双向)
+- 纯通信时间下限: 78.9 / 50 ≈ 1.6s
+- 实际通信时间占比: ~1.6/32 ≈ 5%
+- **结论：通信不是瓶颈，compute-bound**
+
+---
+
+## 八、关键指标卡 (Per Training Step, B=1, 8 NPU)
+
+| 指标 | 数值 |
+|------|------|
+| 模型总参数 | ~16.5B (含冻结编码器) |
+| DiT 参数 | ~14B |
+| 可训练参数 | ~86M (0.52%) |
+| 视频 token 数 | 3,960 (clean 1980 + noisy 1980) |
+| Action token 数 | 24 |
+| State token 数 | 1 |
+| 主序列总 token 数 | 3,985 |
+| Context token 数 (cross-attn) | 769 |
+| Per-token 维度 | 5,120 |
+| 主序列大小 (bf16) | **~38.9 MB** |
+| Context 大小 (bf16) | **~7.6 MB** |
+| FSDP 单元数 | 41 (40 blocks + 1 embed) |
+| All-gather 数据量 (fwd, per card) | 3.6 GB sent, 25.1 GB recv |
+| Reduce-scatter 数据量 (bwd, per card) | 25.1 GB sent+recv |
+| HCCL 总通信量 (per step, per card) | **~78.9 GB** |
+| 激活峰值内存 (per card) | ~19.5 GB |
+| 参数+优化器内存 (per card) | ~10.5 GB |
+| 训练时间 (per step) | ~32s |
+| 有效吞吐量 | ~0.031 steps/s |
+| 1000 steps 预计时间 | ~8.9 hours |
+| 100K steps 预计时间 | ~37 days |
+
+---
+
+## 九、优化空间分析
+
+### 9.1 增大 Batch Size
+
+当前 per_device_batch_size=1, num_views=3。有效 batch = 3 samples/step。
+- 显存余量: 61.28 - 19.5 ≈ 41.8 GB
+- 增大到 batch_size=2: 激活 ~39 GB → 仍在余量内
+- **预期加速**: ~1.5-1.7× (通信摊薄)
+
+### 9.2 Gradient Checkpointing 调优
+
+- 当前 `use_reentrant=True`：安全但保守
+- 改为 `use_reentrant=False`：减少 recompute，但 NPU pre-backward hook 有已知问题
+- **不建议在 NPU 上修改**（Fix 7 相关，NPU 的 queue_callback 不触发）
+
+### 9.3 FSDP 参数调优
+
+- `backward_prefetch=no_prefetch`（当前保守设置）
+- 改为 `BACKWARD_PRE`：预取下一层参数，可能减少等待时间
+- **风险**：NPU pre-backward hook 兼容性问题
+
+### 9.4 混合精度
+
+- 当前 bf16 训练 + fp32 优化器
+- Pure bf16 优化器可省 ~340 MB per card（但精度损失未知）
+
+### 9.5 CPU Offload
+
+- T5/CLIP/VAE 已在首次编码后卸载到 CPU → **已优化**
+- 编码结果（context）保留在 NPU → 用于 cross-attention
+
+---
+
+## 十、与原始 DreamZero 论文的差异
+
+| 维度 | 论文 | 本实现 |
+|------|------|--------|
+| 硬件 | NVIDIA GPU (H100/A100) | Huawei Ascend 910 NPU |
+| FSDP 后端 | NCCL | HCCL (HCCS 互联) |
+| Flash Attention | FA2/3 | SDPA 降级 |
+| RoPE | complex/polar | real-valued (NPU 不支持 complex) |
+| 分布式框架 | DeepSpeed ZeRO-2 可选 | FSDP only |
+| communication | NVLink/NVSwitch | HCCS |
+| batch_size | 未明确 | 1 per device |
+| 显存 | 80 GB (H100) | 61.28 GB (Ascend 910) |
+
+---
+
+*文档生成日期：2026-07-21*  
+*基于 commit 1834044 的训练配置和实测数据*
