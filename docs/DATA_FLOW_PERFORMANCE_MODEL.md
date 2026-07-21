@@ -311,44 +311,52 @@
 
 | 参数 | 值 |
 |------|-----|
-| 总 DiT 参数 | ~14B (不含 T5/CLIP/VAE) |
-| FSDP 单元 | 40 × CausalWanAttentionBlock + 1 × patch_embedding |
-| 每单元参数（均值） | ~350M |
-| 每单元大小 (bf16) | ~700 MB |
-| 每卡分片 (8 NPU) | ~87.5 MB per unit |
+| 总模型参数 | ~16.5B (含冻结编码器，不含) |
+| DiT 参数量 | ~16.2B（blocks 16.15B + embeddings/head ~0.3B） |
+| FSDP 单元数 | 41 (1 root + 40 × CausalWanAttentionBlock) |
+| Per-block 参数 | **~403.8M** |
+| Per-block 大小 (bf16) | **~807.7 MB** |
+| Per-block per-card 分片 (8 NPU) | **~101 MB** |
+| Root unit 参数 | ~336M (patch_emb, text_emb, time_emb, time_proj, head, encoders/decoders) |
+| Root unit 大小 (bf16) | ~672 MB |
 
-### 3.2 All-Gather 通信（Forward）
+### 3.2 Per-Block 参数明细
 
-每次 forward 经过一个 FSDP 单元时：
-1. All-gather: 7 张卡各送 ~87.5 MB → 每卡收 ~612.5 MB（凑齐完整参数）
+| 组件 | 操作 | 参数量 |
+|------|------|--------|
+| Self-attn (q,k,v,o) | 4 × Linear(5120,5120) | ~104.9M |
+| Cross-attn (q,k,v,o,k_img,v_img) | 6 × Linear(5120,5120) | ~157.3M |
+| FFN (ffn.0, ffn.2) | Linear(5120,13824) + Linear(13824,5120) | ~141.6M |
+| RMS norms + modulation | 5×RMSNorm + nn.Parameter(6,5120) | ~0.07M |
+| **Per block 合计** | | **~403.8M** |
+| **40 blocks 合计** | | **~16.15B** |
+
+### 3.3 All-Gather 通信（Forward）
+
+每次 forward 经过一个 FSDP 单元时（per block, per card）：
+1. All-gather: 7 张卡各送 ~101 MB → 每卡收 ~707 MB（凑齐完整 ~808 MB block）
 2. 该卡用完整参数计算 forward
 3. 释放 all-gathered 副本（或保留到 backward）
 
-**Per layer per step:**
-- All-gather 发送: 87.5 MB (per card)
-- All-gather 接收: 612.5 MB (per card)
-- 40 layers + embedding: 41 × 87.5 MB sent = 3.59 GB sent per card per step
-- 41 × 612.5 MB received = 25.1 GB received per card per step
+**Per step forward (40 blocks + root unit):**
+- All-gather 发送: 40 × 707 + 588 = **28.9 GB** per card
+- All-gather 接收: **28.9 GB** per card
 
-### 3.3 Reduce-Scatter 通信（Backward）
+### 3.4 Reduce-Scatter 通信（Backward）
 
 Backward 计算完梯度后：
-1. Reduce-scatter: 梯度均摊回各卡
-2. 每卡发送 ~612.5 MB, 保留 ~87.5 MB 分片
+- All-gather（获取完整参数用于梯度计算）：**28.9 GB** send + **28.9 GB** recv per card
+- Reduce-scatter（梯度均摊回各卡）：**28.9 GB** send + **~3.6 GB** recv per card
 
-**Per step backward:**
-- 发送: ~25.1 GB per card
-- 接收: ~25.1 GB per card
+### 3.5 总 HCCL 通信量 (per training step, per card)
 
-### 3.4 总 HCCL 通信量 (per training step, per card)
+| 方向 | Forward AG (send/recv) | Backward AG (send/recv) | RS (send/recv) | **合计** |
+|------|----------------------|------------------------|----------------|----------|
+| Send | 28.9 GB | 28.9 GB | 28.9 GB | **86.7 GB** |
+| Recv | 28.9 GB | 28.9 GB | 3.6 GB | **61.4 GB** |
+| **双向总计** | | | | **~148 GB** |
 
-| 方向 | Forward (all-gather) | Backward (reduce-scatter) | 合计 |
-|------|---------------------|--------------------------|------|
-| Send | 3.59 GB | 25.1 GB | **28.7 GB** |
-| Recv | 25.1 GB | 25.1 GB | **50.2 GB** |
-| **双向总计** | | | **~78.9 GB** |
-
-> HCCL (Huawei Collective Communication Library) 基于 HCCS (Huawei Cache Coherence System) 互联，理论带宽约 56-100 GB/s per link。16 卡场景下双向通信时间约 1-3 秒。
+> 注：这是逻辑数据量下限。Ring all-gather 实现引入的额外开销（分段传输、等待）可能使实际通信量更高。
 
 ---
 
@@ -361,13 +369,14 @@ Backward 计算完梯度后：
 | 无 checkpoint | 全部 40 层中间激活 | ~15-20 GB |
 | Checkpoint (use_reentrant=True) | 仅 checkpoint 边界 | ~3-5 GB |
 
-**当前配置**: `use_reentrant=True`，每层 re-compute forward。实际：forward 跑两遍（第一遍不存中间值，backward 时重新 forward），所以 compute 翻倍但内存大幅降低。
+**当前配置**: `use_reentrant=False`（非重入 autograd Function）。每层 DiT block 的 forward 中只保存输入 tensor `x`，所有中间激活（QKV 投影、attention scores、FFN 中间值、modulation 输出）在 backward 时重新计算。
 
 ### 4.2 Recompute 开销
 
-- Forward pass: 1× (正常 forward)
+- Forward pass: 1× (正常 forward，只保存 checkpoint 边界 tensor `x`)
 - Backward pass: 每层重新 forward + backward: 1× + 1× = 2×
 - **总 compute**: 3× forward + 1× backward = ~4× 纯 forward
+- **Saved tensors**: 40 × [B, 3985, 5120] bf16 ≈ 40 × 38.9 MB ≈ **1.56 GB**（仅输入，不含 context/e0/freqs）
 
 ---
 
@@ -380,25 +389,64 @@ Backward 计算完梯度后：
 | Rank | 4 |
 | Alpha | 4 |
 | 目标模块 | q, k, v, o, ffn.0, ffn.2 |
-| 注入层数 | 40 layers × 6 modules = 240 LoRA pairs |
+| 注入层数 | 40 blocks × 10 modules = 400 LoRA pairs |
+| ⚠️ 注意 | PEFT 按后缀匹配 → q,k,v,o 同时注入 self_attn 和 cross_attn |
 
 ### 5.2 参数量计算
 
-**SelfAttention (q, k, v, o)：**
-- Per layer: 4 × (5120×4 + 4×5120) = 4 × 40,960 = 163,840
-- 40 layers: 6,553,600
+**每个 Linear(5120, 5120) 适配器（q, k, v, o）：**
+- lora_A: 4 × 5120 = 20,480
+- lora_B: 5120 × 4 = 20,480
+- 合计: 40,960
 
-**FFN (ffn.0, ffn.2)：**
-- ffn.0: (5120×4 + 4×13824) = 20,480 + 55,296 = 75,776
-- ffn.2: (13824×4 + 4×5120) = 55,296 + 20,480 = 75,776
-- Per layer: 151,552
-- 40 layers: 6,062,080
+**每个 ffn.0 适配器（Linear(5120, 13824)）：**
+- lora_A: 4 × 5120 = 20,480
+- lora_B: 13824 × 4 = 55,296
+- 合计: 75,776
 
-**LoRA 参数合计**: ~12.6M (bf16) ≈ **25.2 MB**
+**每个 ffn.2 适配器（Linear(13824, 5120)）：**
+- lora_A: 4 × 13824 = 55,296
+- lora_B: 5120 × 4 = 20,480
+- 合计: 75,776
 
-加上 Action Encoder (~62M)、State Encoder (~0.5M)、Action Decoder (~11M)：
-**总可训练参数**: ~86.1M → bf16 下 **~172 MB**（所有卡完全复制）
-优化器状态 (AdamW, fp32): ~172 × 3 = **~516 MB per card**
+**Per block：**
+| 模块组 | 数量 | 每个 | 小计 |
+|--------|------|------|------|
+| q (self+cross) | 2 | 40,960 | 81,920 |
+| k (self+cross) | 2 | 40,960 | 81,920 |
+| v (self+cross) | 2 | 40,960 | 81,920 |
+| o (self+cross) | 2 | 40,960 | 81,920 |
+| ffn.0 | 1 | 75,776 | 75,776 |
+| ffn.2 | 1 | 75,776 | 75,776 |
+| **Per block 合计** | **10** | | **479,232** |
+
+**40 blocks LoRA 合计**: 19,169,280 (~19.2M)
+
+### 5.3 非 LoRA 可训练参数
+
+| 模块 | 参数量 | 备注 |
+|------|--------|------|
+| state_encoder (CategorySpecificMLP) | ~10.6M | input=64, hidden=1024, output=5120 |
+| action_encoder (MultiEmbodimentActionEncoder) | ~78.8M | CategorySpecificLinear ×3 |
+| action_decoder (CategorySpecificMLP) | ~5.3M | input=5120, hidden=1024, output=7 |
+| **非 LoRA 小计** | **~94.7M** | |
+
+### 5.4 总计
+
+| 类别 | 参数量 | bf16 大小 |
+|------|--------|-----------|
+| LoRA (40 blocks) | 19.2M | 38.4 MB |
+| 非 LoRA 可训练 | 94.7M | 189.4 MB |
+| **总可训练参数** | **~113.9M** | **~227.8 MB** |
+| 基座冻结 (DiT + embeddings) | ~16.4B | ~32.7 GB |
+| **模型总参数** | **~16.5B** | **~33.0 GB** |
+
+**优化器状态 (AdamW, fp32 per card, 8 NPU FSDP sharded):**
+- exp_avg (fp32): 227.8 × 2 = 455.6 MB → /8 = 57.0 MB
+- exp_avg_sq (fp32): 227.8 × 2 = 455.6 MB → /8 = 57.0 MB
+- 参数 (bf16): 227.8 MB → /8 = 28.5 MB
+- **每卡优化器+参数总计**: ~142.5 MB
+- 加上 frozen 参数分片 (16.4B/8 × 2 bytes): ~4.1 GB
 
 ---
 
@@ -455,11 +503,24 @@ Backward 计算完梯度后：
 
 ### 7.3 HCCL 带宽利用率
 
-- Per step 双向总通信: ~78.9 GB
-- 假设 HCCS 有效带宽: ~50 GB/s (双向)
-- 纯通信时间下限: 78.9 / 50 ≈ 1.6s
-- 实际通信时间占比: ~1.6/32 ≈ 5%
+- Per step 单向总发送: ~86.7 GB per card
+- 假设 HCCS 有效带宽: ~50 GB/s (单向)
+- 纯通信时间下限: 86.7 / 50 ≈ 1.7s
+- 实际通信时间占比: ~1.7/32 ≈ 5.3%
 - **结论：通信不是瓶颈，compute-bound**
+
+---
+
+### 7.4 NPU FSDP Cleanup（关键适配）
+
+NPU 上 `_post_backward_final_callback` 不触发 → FSDP 状态残留 → Step 1+ OOM。
+每个 training_step 执行三段手动清理（`base.py`）：
+
+1. **重置执行顺序**：`_exec_order_data._iter = 0`, `handles_post_forward_order.clear()`
+2. **删除残留 hook state**：`flat_param._post_backward_hook_state` → 重新注册
+3. **重置训练状态**：`training_state → IDLE`, `_ran_pre_backward_hook = False`
+
+额外 monkey-patch `_assert_in_training_states` 放宽 gradient checkpointing 时的状态检查。
 
 ---
 
@@ -468,8 +529,9 @@ Backward 计算完梯度后：
 | 指标 | 数值 |
 |------|------|
 | 模型总参数 | ~16.5B (含冻结编码器) |
-| DiT 参数 | ~14B |
-| 可训练参数 | ~86M (0.52%) |
+| DiT Block 参数 (40 blocks) | ~16.15B (~403.8M/block) |
+| 可训练参数 | ~113.9M (0.69%) — LoRA 19.2M + Encoder/Decoder 94.7M |
+| LoRA adapters | 400 (10/block: q,k,v,o×2 + ffn.0,ffn.2) |
 | 视频 token 数 | 3,960 (clean 1980 + noisy 1980) |
 | Action token 数 | 24 |
 | State token 数 | 1 |
@@ -477,17 +539,19 @@ Backward 计算完梯度后：
 | Context token 数 (cross-attn) | 769 |
 | Per-token 维度 | 5,120 |
 | 主序列大小 (bf16) | **~38.9 MB** |
-| Context 大小 (bf16) | **~7.6 MB** |
-| FSDP 单元数 | 41 (40 blocks + 1 embed) |
-| All-gather 数据量 (fwd, per card) | 3.6 GB sent, 25.1 GB recv |
-| Reduce-scatter 数据量 (bwd, per card) | 25.1 GB sent+recv |
-| HCCL 总通信量 (per step, per card) | **~78.9 GB** |
+| Context 大小 (bf16) | **~7.9 MB** |
+| FSDP 单元数 | 41 (40 blocks + 1 root) |
+| Per-block 参数 (bf16) | ~807.7 MB |
+| Per-card per-block shard | ~101 MB |
+| All-gather per step per card (fwd) | 28.9 GB send + 28.9 GB recv |
+| All-gather per step per card (bwd) | 28.9 GB send + 28.9 GB recv |
+| Reduce-scatter per step per card | 28.9 GB send + 3.6 GB recv |
+| HCCL 总通信量 (per step, per card) | **~148 GB 双向** |
 | 激活峰值内存 (per card) | ~19.5 GB |
-| 参数+优化器内存 (per card) | ~10.5 GB |
+| 优化器状态 (per card, sharded) | ~142 MB (仅可训练参数) |
 | 训练时间 (per step) | ~32s |
 | 有效吞吐量 | ~0.031 steps/s |
 | 1000 steps 预计时间 | ~8.9 hours |
-| 100K steps 预计时间 | ~37 days |
 
 ---
 
