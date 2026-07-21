@@ -600,6 +600,171 @@ NPU 上 `_post_backward_final_callback` 不触发 → FSDP 状态残留 → Step
 | communication | NVLink/NVSwitch | HCCS |
 | batch_size | 未明确 | 1 per device |
 | 显存 | 80 GB (H100) | 61.28 GB (Ascend 910) |
+| 可训练参数 | 全量 16.5B (?)| LoRA 114M (0.69%) |
+
+---
+
+## 十一、全量训练 (Full Fine-Tuning) 性能建模
+
+> **场景假设**：16.5B DiT 参数全部可训练，LoRA 移除，其余配置不变。
+> B=1, 8× Ascend 910 (61.28 GB), bf16 混合精度, FSDP full_shard, gradient checkpointing。
+
+### 11.1 与 LoRA 训练的核心差异
+
+| 维度 | LoRA 训练 | 全量训练 | 倍数 |
+|------|----------|---------|------|
+| 可训练参数 | 113.9M | 16,500M | **145×** |
+| 梯度参数量 (per step) | 113.9M fp32 | 16,500M fp32 | **145×** |
+| 优化器状态总量 | 113.9M × 8B = 0.91 GB | 16,500M × 8B = 132 GB | **145×** |
+| 参数更新量 (per step) | 113.9M bf16 | 16,500M bf16 | **145×** |
+| Forward 计算量 | 相同 | 相同 | 1× |
+| Backward 计算量 | 仅 LoRA grad | 全量 grad | ~3-4× |
+| 激活值内存 | 相同 | 相同 | 1× |
+| 前向数据流 | 相同 | 相同 | 1× |
+
+### 11.2 显存占用分解 (per NPU card, 8-way FSDP sharding)
+
+| 组件 | LoRA 训练 | 全量训练 | 增量 |
+|------|----------|---------|------|
+| DiT 参数分片 (bf16) | ~4.1 GB | ~4.1 GB | — |
+| 可训练参数副本 (bf16, 非 shard) | ~0.23 GB | — | -0.23 GB |
+| Master 参数 (fp32, sharded) | — | ~8.25 GB | +8.25 GB |
+| 梯度 (fp32, per-unit peak) | ~0.01 GB | ~0.81 GB | +0.80 GB |
+| 优化器 exp_avg (fp32, sharded) | ~0.06 GB | ~8.25 GB | +8.19 GB |
+| 优化器 exp_avg_sq (fp32, sharded) | ~0.06 GB | ~8.25 GB | +8.19 GB |
+| All-gather buffer (peak 1 block) | ~0.81 GB | ~0.81 GB | — |
+| Saved checkpoint inputs (40 blocks) | ~1.56 GB | ~1.56 GB | — |
+| Persistent tensors (context, e0) | ~0.32 GB | ~0.32 GB | — |
+| Recompute intermediates (peak) | ~0.21 GB | ~0.21 GB | — |
+| 其他开销 (CUDA context, etc.) | ~2 GB | ~2 GB | — |
+| **总计 per card** | **~9.4 GB** | **~34.6 GB** | **+25.2 GB** |
+| **HBM 利用率 (61.28 GB)** | **15%** | **56%** | |
+
+> **关键结论：全量训练在 8× Ascend 910 上可以跑，显存利用率 ~56%。余量约 26.7 GB，batch_size=1 安全，batch_size=2 需验证。**
+
+### 11.3 优化器状态详细分解
+
+全量训练下 AdamW 优化器追踪所有 16.5B 参数：
+
+| 状态 | 精度 | 总大小 | Per-card (8-way shard) |
+|------|------|--------|------------------------|
+| Master params | fp32 | 66.0 GB | 8.25 GB |
+| exp_avg (momentum) | fp32 | 66.0 GB | 8.25 GB |
+| exp_avg_sq (variance) | fp32 | 66.0 GB | 8.25 GB |
+| **优化器状态合计** | | **198.0 GB** | **24.75 GB** |
+
+对比 LoRA 训练（仅可训练参数有优化器状态）：
+- LoRA 优化器状态总量: 113.9M × 12 bytes = 1.37 GB → /8 = 0.17 GB per card
+- **全量 / LoRA = 24.75 / 0.17 ≈ 145×**
+
+### 11.4 HCCL 通信量变化
+
+前向通信 (all-gather) 完全相同（参数相同）。反向通信显著增大：
+
+**Reduce-Scatter（梯度汇聚）：**
+
+以单个 403.8M-param block 为单位：
+- Block fp32 梯度: 403.8M × 4 bytes = 1,615 MB
+- 分为 8 shards: 每 shard ~202 MB
+- Per card send: 7 shards × 202 MB = 1,414 MB
+- Per card recv: 7 cards × 202 MB = 1,414 MB
+
+40 blocks + root unit (~336M params, ~1,344 MB fp32 gradients):
+- Root unit per card RS: ~1,176 MB send, ~1,176 MB recv
+
+| 通信阶段 | LoRA | 全量 | 增量 |
+|----------|------|------|------|
+| Forward AG send | 28.9 GB | 28.9 GB | — |
+| Forward AG recv | 28.9 GB | 28.9 GB | — |
+| Backward AG send | 28.9 GB | 28.9 GB | — |
+| Backward AG recv | 28.9 GB | 28.9 GB | — |
+| Reduce-scatter send | ~0.5 GB | **~57.7 GB** | **115×** |
+| Reduce-scatter recv | ~0.5 GB | **~57.7 GB** | **115×** |
+| **Per card 单向发送总计** | **~58.3 GB** | **~115.5 GB** | **1.98×** |
+| **Per card 单向接收总计** | **~58.3 GB** | **~115.5 GB** | **1.98×** |
+| **Per card 双向总计** | **~116.6 GB** | **~231.0 GB** | **1.98×** |
+
+> 注：LoRA 训练的 reduce-scatter 仅传输可训练参数的梯度。全量训练传输全部 16.5B 参数的梯度。
+
+### 11.5 Per-Step 时间估算
+
+| 阶段 | LoRA (32s) | 全量 (估算) | 变化原因 |
+|------|-----------|------------|----------|
+| 数据加载 + transforms | ~2-3s | ~2-3s | 相同 |
+| VAE/CLIP/T5 encode | ~3-5s | ~3-5s | 相同 |
+| DiT forward (40 layers) | ~8-10s | ~8-10s | 相同 |
+| DiT backward + GC recompute | ~12-15s | **~18-25s** | 全量梯度计算 + 全量 reduce-scatter |
+| HCCL reduce-scatter | ~0.2s | **~1.2-1.5s** | 57.7 GB vs 0.5 GB per card |
+| Optimizer step | ~0.5-1s | **~5-8s** | 更新 16.5B vs 114M 参数 |
+| **总计** | **~32s** | **~40-55s** | **1.25-1.7×** |
+
+> HCCS 有效带宽按 50 GB/s 计算，纯 RS 通信时间下限: 57.7/50 ≈ 1.15s。  
+> Optimizer step 时间取决于 NPU 内存带宽和 AdamW 实现的效率，8.25 GB 参数更新约需 5-8s。
+
+### 11.6 16 NPU 场景
+
+Ascend 910 服务器有 16 个物理 NPU。扩展到 16 卡：
+
+| 指标 | 8 NPU | 16 NPU | 变化 |
+|------|-------|--------|------|
+| Per-card 参数分片 | 4.1 GB | 2.06 GB | ½× |
+| Per-card 优化器状态 | 24.75 GB | 12.38 GB | ½× |
+| Per-card 总显存 | ~34.6 GB | ~20.3 GB | 0.59× |
+| HBM 利用率 | 56% | 33% | |
+| Per-card HCCL send | 115.5 GB | ~65 GB | 0.56× |
+| 有效 batch size | 8 | 16 | 2× |
+| Per-step 时间 (估算) | ~40-55s | ~45-60s | 通信拓扑变化 |
+
+> 16 NPU 场景显存更宽裕 (33%)。HCCL 通信拓扑从 8 卡变为 16 卡，ring all-gather 跳数增加，但每卡传输量减少。总通信时间可能相近或略增。
+
+### 11.7 全量训练 vs LoRA 训练：决策矩阵
+
+| 维度 | LoRA 训练 | 全量训练 |
+|------|----------|---------|
+| 显存需求 (per card) | ~9.4 GB ✅ | ~34.6 GB ✅ |
+| 训练速度 | ~32s/step | ~40-55s/step (1.25-1.7× slower) |
+| Checkpoint 大小 | ~228 MB | ~66 GB (fp32 master) / ~33 GB (bf16) |
+| Checkpoint 保存时间 | ~1-2s | ~30-60s (I/O bound) |
+| 灾难恢复 | 快速（小 checkpoint） | 慢（大 checkpoint） |
+| 微调灵活性 | 可快速切换任务 | 需保存完整权重 |
+| 过拟合风险 | 低（仅 0.69% 参数） | 高（需更强正则化） |
+| 精度上限 | 受 LoRA rank 限制 | 理论上限更高 |
+| 数据效率 | 小数据集友好 | 需大量数据 |
+
+### 11.8 全量训练的 Checkpoint 策略
+
+| 策略 | 大小 | 保存时间 | 恢复方式 |
+|------|------|----------|----------|
+| Full state dict (fp32) | ~66 GB | ~60-120s | 完整恢复 |
+| Full state dict (bf16) | ~33 GB | ~30-60s | 完整恢复 |
+| Sharded checkpoint (8 shards) | ~8.25 GB/shard | ~10-15s/shard | 需同数量 GPU 恢复 |
+| FSDP checkpoint (distributed) | ~8.25 GB/卡同步写 | ~10-20s | `torch.distributed.checkpoint` |
+
+> 推荐使用 sharded/distributed checkpoint 方式。每个 checkpoint 约 8.25 GB per card × 8 cards = 66 GB total。
+> 1000 steps 保存一次 → 10 checkpoints → 660 GB 磁盘。需确保 `/checkpoints` 分区 (294 GB) 有足够空间或使用外部存储。
+
+### 11.9 数据流不变部分
+
+以下阶段在全量训练中**完全不变**（因为 forward pass 相同）：
+
+```
+Stage 0:  DreamTransform 网格拼接
+Stage 1:  Video 预处理 (resize, normalize)
+Stage 2:  VAE Encode
+Stage 3:  CLIP + T5 Encode
+Stage 4:  Flow Matching Noise
+Stage 5:  Patch Embedding
+Stage 6:  Token Assembly (Teacher Forcing)
+Stage 7:  DiT × 40 Forward (compute-wise)
+Stage 8:  Head + Unpatchify
+Stage 9:  Loss Computation
+```
+
+**变化的阶段**：
+- **Stage 7 反向**：梯度计算量 145×（所有参数，非仅 LoRA）
+- **HCCL Reduce-Scatter**：通信量 ~115×（全量梯度 vs LoRA 梯度）
+- **Optimizer Step**：更新量 145×（16.5B vs 114M 参数）
+- **Checkpoint I/O**：保存量 ~145×（66 GB vs 0.46 GB）
 
 ---
 
