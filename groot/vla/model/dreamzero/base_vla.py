@@ -376,20 +376,84 @@ class VLA(PreTrainedModel):
         config = VLAConfig(**config_dict)
         print("loading model")
 
-        # Disable defer_lora_injection so LoRA layers are created during init,
-        # matching the PEFT key hierarchy (base_model.model.*) in the checkpoint.
+        # Post-training workflow support: if the checkpoint was trained from a
+        # pretrained DreamZero checkpoint (pretrained_model_path in
+        # experiment_cfg/conf.yaml, e.g. DreamZero-AgiBot), the LoRA deltas are
+        # relative to THAT base, not to the raw Wan weights in
+        # diffusion_model_pretrained_path. Rebuild the same composition as
+        # training: base checkpoint first, then LoRA injection, then deltas.
+        pretrained_base_path = None
+        conf_yaml_path = os.path.join(
+            pretrained_model_name_or_path, "experiment_cfg", "conf.yaml"
+        )
+        if os.path.exists(conf_yaml_path):
+            from omegaconf import OmegaConf
+            train_cfg = OmegaConf.load(conf_yaml_path)
+            pretrained_base_path = train_cfg.get("pretrained_model_path", None)
+        if pretrained_base_path is not None and not os.path.isdir(str(pretrained_base_path)):
+            raise FileNotFoundError(
+                f"This LoRA checkpoint was post-trained from "
+                f"'{pretrained_base_path}' (recorded in experiment_cfg/conf.yaml), "
+                f"but that directory does not exist. Loading the LoRA deltas onto "
+                f"a different base would silently produce a wrong model. Place the "
+                f"base checkpoint at that path (or a symlink) and retry."
+            )
+
         ah_cfg = config.action_head_cfg
         inner = ah_cfg.get('config', ah_cfg) if isinstance(ah_cfg.get('config'), dict) else ah_cfg
-        if 'defer_lora_injection' in inner:
-            inner['defer_lora_injection'] = False
-            print("defer_lora_injection disabled for load_lora")
-        # Enable component loading so DiT base weights are loaded from pretrained
-        if 'skip_component_loading' in inner:
-            inner['skip_component_loading'] = False
-            print("skip_component_loading disabled for load_lora")
 
-        # Instantiate model (LoRA layers now exist from init)
-        model = cls(config)
+        if pretrained_base_path is not None:
+            # Match training (groot/vla/experiment/base.py create_model):
+            # instantiate WITHOUT LoRA layers and WITHOUT component loading,
+            # load the full base checkpoint (plain key hierarchy), then inject
+            # LoRA so the PEFT keys exist for the delta overlay below.
+            if 'defer_lora_injection' in inner:
+                inner['defer_lora_injection'] = True
+            if 'skip_component_loading' in inner:
+                inner['skip_component_loading'] = True
+            print(f"Loading pretrained base checkpoint from: {pretrained_base_path}")
+            model = cls(config)
+
+            base_index_path = os.path.join(str(pretrained_base_path), "model.safetensors.index.json")
+            base_single_path = os.path.join(str(pretrained_base_path), "model.safetensors")
+            if os.path.exists(base_index_path):
+                import gc
+                with open(base_index_path, 'r') as f:
+                    base_index = json.load(f)
+                for shard_file in sorted(set(base_index["weight_map"].values())):
+                    print(f"Loading base shard: {shard_file}")
+                    shard_state_dict = load_file(os.path.join(str(pretrained_base_path), shard_file))
+                    model.load_state_dict(shard_state_dict, strict=False)
+                    del shard_state_dict
+                    gc.collect()
+            elif os.path.exists(base_single_path):
+                model.load_state_dict(load_file(base_single_path), strict=False)
+            else:
+                raise FileNotFoundError(
+                    f"No model.safetensors[.index.json] found in base checkpoint "
+                    f"'{pretrained_base_path}'."
+                )
+
+            if (hasattr(model, 'action_head')
+                    and hasattr(model.action_head, 'inject_lora_after_loading')
+                    and getattr(model.action_head, 'train_architecture', None) == 'lora'):
+                model.action_head.inject_lora_after_loading()
+                print("LoRA injected on top of pretrained base")
+        else:
+            # Original (from-scratch / DROID) workflow: the DiT base is the one
+            # referenced by diffusion_model_pretrained_path in config.json.
+            # Disable defer_lora_injection so LoRA layers are created during init,
+            # matching the PEFT key hierarchy (base_model.model.*) in the checkpoint.
+            if 'defer_lora_injection' in inner:
+                inner['defer_lora_injection'] = False
+                print("defer_lora_injection disabled for load_lora")
+            # Enable component loading so DiT base weights are loaded from pretrained
+            if 'skip_component_loading' in inner:
+                inner['skip_component_loading'] = False
+                print("skip_component_loading disabled for load_lora")
+
+            # Instantiate model (LoRA layers now exist from init)
+            model = cls(config)
 
         # Remove .base_layer from keys if present
         has_base_layer = any(".base_layer." in key for key in state_dict.keys())
