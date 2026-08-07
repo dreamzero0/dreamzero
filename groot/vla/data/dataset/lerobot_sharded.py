@@ -1220,11 +1220,11 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
             if additional_idx < trajectory_length and unique_sorted.size < max_frames:
                 unique_sorted = np.append(unique_sorted, additional_idx)
             else:
-                # Trim to 8n+1 format. Require at least 9 frames so (noisy_frames-1)//num_frame_per_block >= 1
-                # for action/state model invariant (CausalWanModel); otherwise return empty so sample is skipped.
-                if unique_sorted.size <= 8:
-                    return np.array([])
-                unique_sorted = unique_sorted[:-7]
+                # Batch >1 requires uniform shapes across the batch: skip
+                # short windows entirely instead of trimming to fewer chunks
+                # (mixed chunk counts crash the collate np.stack). dtype must
+                # be integer: the empty array is used as an index downstream.
+                return np.array([], dtype=np.int64)
         
         # ensure that unique_sorted has 4n+1 frames
         assert unique_sorted.size % 8 == 1, f"unique_sorted size {unique_sorted.size} is not 4n+1"
