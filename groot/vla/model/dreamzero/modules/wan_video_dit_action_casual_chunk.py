@@ -2140,7 +2140,12 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     use_reentrant=False,
                 )
             else:
-                x = block(x, **kwargs)
+                # Blocks return (x, kv_cache); only the checkpointed branch
+                # unpacked it, so any grad-disabled training forward (e.g.
+                # deterministic eval of the training objective) crashed with
+                # AttributeError: 'tuple' object has no attribute 'shape'.
+                x, _updated_kv_cache = block(x, **kwargs)
+                assert _updated_kv_cache is None
 
         if clean_x is not None:
             x = x[:, clean_x.shape[1]:]
