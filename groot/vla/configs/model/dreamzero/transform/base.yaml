@@ -33,6 +33,9 @@ embodiment_tag_to_projector_index:
   oxe_plex: 30
   dream: 31
   yam: 32
+  # Logical G2 identity. The current DreamZero-AgiBot action adapter is
+  # single-embodiment internally and maps this to local adapter slot 0.
+  g2: 33
   xdof: 22
   gr1_unified_segmentation: 14
   language_table_sim: 7

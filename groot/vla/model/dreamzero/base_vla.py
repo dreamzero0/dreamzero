@@ -102,6 +102,106 @@ class VLA(PreTrainedModel):
         if detected_error:
             raise ValueError(error_msg)
 
+    @classmethod
+    def load_action_adapter(
+        cls,
+        adapter_model_path: str,
+        pretrained_base_model_path: str,
+        config: VLAConfig | None = None,
+    ):
+        """Load a clean DreamZero base and then a strict G2 action adapter."""
+        import json
+        import os
+        from safetensors.torch import load_file
+
+        if config is None:
+            config = cls.config_class.from_pretrained(adapter_model_path)
+        model = cls(config)
+        model_state = model.state_dict()
+        adapter_prefixes = (
+            "action_head.model.state_encoder.",
+            "action_head.model.action_encoder.",
+            "action_head.model.action_decoder.",
+        )
+
+        index_path = os.path.join(
+            pretrained_base_model_path,
+            "model.safetensors.index.json",
+        )
+        single_path = os.path.join(
+            pretrained_base_model_path,
+            "model.safetensors",
+        )
+        if os.path.exists(index_path):
+            with open(index_path) as stream:
+                index = json.load(stream)
+            base_files = [
+                os.path.join(pretrained_base_model_path, filename)
+                for filename in sorted(set(index["weight_map"].values()))
+            ]
+        elif os.path.exists(single_path):
+            base_files = [single_path]
+        else:
+            raise FileNotFoundError(
+                f"No DreamZero base weights at {pretrained_base_model_path}"
+            )
+
+        loaded_base_keys: set[str] = set()
+        skipped_base_keys: set[str] = set()
+        for base_file in base_files:
+            shard = load_file(base_file)
+            compatible = {}
+            for key, value in shard.items():
+                if key in model_state and model_state[key].shape == value.shape:
+                    compatible[key] = value
+                    loaded_base_keys.add(key)
+                else:
+                    skipped_base_keys.add(key)
+            model.load_state_dict(compatible, strict=False)
+
+        required_shared_keys = {
+            key
+            for key in model_state
+            if not key.startswith(adapter_prefixes)
+        }
+        missing_shared = sorted(required_shared_keys - loaded_base_keys)
+        if missing_shared:
+            raise RuntimeError(
+                "Incomplete shared DreamZero base load; missing shared keys: "
+                + ", ".join(missing_shared[:20])
+            )
+        print(
+            "[BASE LOAD] DreamZero-AgiBot loaded "
+            f"shared_keys={len(required_shared_keys)} "
+            f"skipped_incompatible={len(skipped_base_keys)}"
+        )
+        print("[EMBODIMENT] g2 (logical id), action-adapter local slot=0")
+
+        adapter_path = os.path.join(
+            adapter_model_path,
+            "action_expert.safetensors",
+        )
+        adapter_state = load_file(adapter_path)
+        expected_adapter_keys = {
+            key for key in model_state if key.startswith(adapter_prefixes)
+        }
+        if set(adapter_state) != expected_adapter_keys:
+            missing = sorted(expected_adapter_keys - set(adapter_state))
+            unexpected = sorted(set(adapter_state) - expected_adapter_keys)
+            raise RuntimeError(
+                "Action adapter key contract mismatch: "
+                f"missing={missing[:20]} unexpected={unexpected[:20]}"
+            )
+        model.load_state_dict(adapter_state, strict=False)
+        for module_name in (
+            "state_encoder",
+            "action_encoder",
+            "action_decoder",
+        ):
+            print(f"[ACTION ADAPTER] {module_name} loaded")
+        print("[SHARED DIT LORA] disabled")
+        return model
+
     def validate_data(self, action_head_outputs, backbone_outputs, is_training):
 
         fail_backbone = (
@@ -336,78 +436,170 @@ class VLA(PreTrainedModel):
 
     @classmethod
     def load_lora(
-        cls, 
-        pretrained_model_name_or_path: str
-    ): 
+        cls,
+        pretrained_model_name_or_path: str,
+        pretrained_base_model_path: str | None = None,
+    ):
+        """Load a LoRA checkpoint on the exact full-model training base.
+
+        A LoRA delta is not a standalone model. G2 training first instantiated
+        the checkpoint architecture, loaded ``DreamZero-AgiBot``, and only then
+        injected LoRA adapters. Inference must mirror that order. Loading the
+        raw Wan component and applying the LoRA delta to it produces a
+        numerically valid but semantically wrong model.
+        """
         from safetensors.torch import load_file
         import os
         import json
-        print("loading lora@@@@@")
+        import gc
 
-        # Check for different checkpoint formats
+        if pretrained_base_model_path is None:
+            raise ValueError(
+                "A LoRA-only checkpoint requires pretrained_base_model_path. "
+                "Use the same full checkpoint recorded as "
+                "pretrained_model_path in experiment_cfg/conf.yaml."
+            )
+        if not os.path.isdir(pretrained_base_model_path):
+            raise FileNotFoundError(
+                f"LoRA base model directory does not exist: "
+                f"{pretrained_base_model_path}"
+            )
+
+        print(
+            "Loading LoRA checkpoint "
+            f"{pretrained_model_name_or_path} on base "
+            f"{pretrained_base_model_path}"
+        )
+
         safetensors_path = os.path.join(pretrained_model_name_or_path, "model.safetensors")
         safetensors_index_path = os.path.join(pretrained_model_name_or_path, "model.safetensors.index.json")
-        
-        state_dict = {}
+
+        lora_state_dict = {}
         if os.path.exists(safetensors_index_path):
-            # Handle sharded safetensors
-            print(f"Loading sharded safetensors using index: {safetensors_index_path}")
-            
             with open(safetensors_index_path, 'r') as f:
                 index = json.load(f)
-            
-            # Load each shard
-            for shard_file in set(index["weight_map"].values()):
+            for shard_file in sorted(set(index["weight_map"].values())):
                 shard_path = os.path.join(pretrained_model_name_or_path, shard_file)
-                print(f"Loading shard: {shard_path}")
-                shard_state_dict = load_file(shard_path)
-                state_dict.update(shard_state_dict)
-                
+                lora_state_dict.update(load_file(shard_path))
         elif os.path.exists(safetensors_path):
-            # Handle single safetensors file
-            print(f"Loading weights from safetensors: {safetensors_path}")
-            state_dict.update(load_file(safetensors_path))
-        
-        # Load config
-        print("loading config@@")
+            lora_state_dict.update(load_file(safetensors_path))
+        else:
+            raise FileNotFoundError(
+                f"No LoRA weights found at {pretrained_model_name_or_path}"
+            )
+
         config_path = os.path.join(pretrained_model_name_or_path, "config.json")
         with open(config_path, "r") as f:
             config_dict = json.load(f)
         config = VLAConfig(**config_dict)
-        print("loading model")
 
-        # Disable defer_lora_injection so LoRA layers are created during init,
-        # matching the PEFT key hierarchy (base_model.model.*) in the checkpoint.
+        # Mirror training: build the target G2 architecture without loading raw
+        # Wan component weights, load the full DreamZero base, then inject LoRA.
         ah_cfg = config.action_head_cfg
         inner = ah_cfg.get('config', ah_cfg) if isinstance(ah_cfg.get('config'), dict) else ah_cfg
-        if 'defer_lora_injection' in inner:
-            inner['defer_lora_injection'] = False
-            print("defer_lora_injection disabled for load_lora")
-        # Enable component loading so DiT base weights are loaded from pretrained
-        if 'skip_component_loading' in inner:
-            inner['skip_component_loading'] = False
-            print("skip_component_loading disabled for load_lora")
-
-        # Instantiate model (LoRA layers now exist from init)
+        inner['defer_lora_injection'] = True
+        inner['skip_component_loading'] = True
         model = cls(config)
 
-        # Remove .base_layer from keys if present
-        has_base_layer = any(".base_layer." in key for key in state_dict.keys())
+        base_index_path = os.path.join(
+            pretrained_base_model_path,
+            "model.safetensors.index.json",
+        )
+        base_single_path = os.path.join(
+            pretrained_base_model_path,
+            "model.safetensors",
+        )
+        loaded_base_keys: set[str] = set()
+        unexpected_base_keys: set[str] = set()
+
+        def load_base_state_dict(base_state_dict: dict) -> None:
+            model_keys = set(model.state_dict())
+            loaded_base_keys.update(set(base_state_dict) & model_keys)
+            _, unexpected = model.load_state_dict(
+                base_state_dict,
+                strict=False,
+            )
+            unexpected_base_keys.update(unexpected)
+
+        if os.path.exists(base_index_path):
+            with open(base_index_path, "r") as f:
+                base_index = json.load(f)
+            for shard_file in sorted(set(base_index["weight_map"].values())):
+                shard_path = os.path.join(
+                    pretrained_base_model_path,
+                    shard_file,
+                )
+                print(f"Loading DreamZero base shard: {shard_path}")
+                base_state_dict = load_file(shard_path)
+                load_base_state_dict(base_state_dict)
+                del base_state_dict
+                gc.collect()
+        elif os.path.exists(base_single_path):
+            base_state_dict = load_file(base_single_path)
+            load_base_state_dict(base_state_dict)
+            del base_state_dict
+            gc.collect()
+        else:
+            raise FileNotFoundError(
+                "No full base weights found at "
+                f"{pretrained_base_model_path}"
+            )
+
+        if not loaded_base_keys:
+            raise RuntimeError(
+                "The full DreamZero base checkpoint did not match any "
+                "parameters in the G2 model architecture"
+            )
+        if unexpected_base_keys:
+            print(
+                "Ignoring base-only keys that are not present in the G2 "
+                f"architecture: count={len(unexpected_base_keys)}"
+            )
+
+        if not (
+            hasattr(model, "action_head")
+            and hasattr(model.action_head, "inject_lora_after_loading")
+        ):
+            raise RuntimeError(
+                "G2 action head does not support deferred LoRA injection"
+            )
+        model.action_head.inject_lora_after_loading()
+
+        has_base_layer = any(
+            ".base_layer." in key for key in lora_state_dict
+        )
         if has_base_layer:
             print("Removing '.base_layer' from state dict keys")
-            state_dict = {k.replace(".base_layer.", "."): v for k, v in state_dict.items()}
+            lora_state_dict = {
+                key.replace(".base_layer.", "."): value
+                for key, value in lora_state_dict.items()
+            }
 
-        # Load weights
-        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-            
-        if missing_keys:
-            print(f"Missing keys when loading pretrained weights: {missing_keys}")
+        model_keys = set(model.state_dict())
+        unknown_lora_keys = set(lora_state_dict) - model_keys
+        if unknown_lora_keys:
+            sample = sorted(unknown_lora_keys)[:20]
+            raise RuntimeError(
+                "LoRA checkpoint keys do not match the model constructed on "
+                f"the DreamZero base: count={len(unknown_lora_keys)}, "
+                f"sample={sample}"
+            )
+
+        missing_keys, unexpected_keys = model.load_state_dict(
+            lora_state_dict,
+            strict=False,
+        )
         if unexpected_keys:
-            print(f"Unexpected keys when loading pretrained weights: {unexpected_keys}")
-        
-        print("Successfully loaded pretrained weights")
+            raise RuntimeError(
+                f"Unexpected LoRA keys after validation: {unexpected_keys}"
+            )
 
-        print(f"{cls}\n")
+        print(
+            "Successfully loaded full DreamZero base and LoRA delta | "
+            f"base_keys={len(loaded_base_keys)} "
+            f"lora_keys={len(lora_state_dict)} "
+            f"model_only_keys={len(missing_keys)}"
+        )
         return model
 
     def load_lora_weight(self, pretrained_model_name_or_path: str):

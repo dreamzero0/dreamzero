@@ -149,7 +149,7 @@ transform_oxe_droid:
       normalization_modes:
         state.joint_position: q99
         state.gripper_position: q99
-  
+
     # Action transforms
     - _target_: groot.vla.data.transform.StateActionToTensor
       apply_to: ${modality_config_oxe_droid.action.modality_keys}
@@ -433,86 +433,10 @@ transform_g2_ee:
     - ${model_specific_transform}
 # END G2_EE_QUATERNION_CONFIG
 
-################################################################################
-# g2 (Unitree G2: dual-arm joints + grippers, state/action 16, 3 views)
-################################################################################
-
-modality_config_g2:
-  video:
-    _target_: groot.vla.data.dataset.ModalityConfig
-    delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
-    eval_delta_indices: [-3,-2,-1,0]
-    modality_keys:
-      - video.top_head
-      - video.hand_left
-      - video.hand_right
-  state:
-    _target_: groot.vla.data.dataset.ModalityConfig
-    delta_indices: [0]
-    modality_keys:
-      - state.left_joint_position
-      - state.left_gripper_position
-      - state.right_joint_position
-      - state.right_gripper_position
-  action:
-    _target_: groot.vla.data.dataset.ModalityConfig
-    delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
-    modality_keys:
-      - action.left_joint_position
-      - action.left_gripper_position
-      - action.right_joint_position
-      - action.right_gripper_position
-  language:
-    _target_: groot.vla.data.dataset.ModalityConfig
-    delta_indices: [0]
-    modality_keys:
-      - annotation.language.action_text
-
-transform_g2:
-  _target_: groot.vla.data.transform.ComposedModalityTransform
-  transforms:
-    - <<: *totensor_cfg
-      apply_to: ${modality_config_g2.video.modality_keys}
-    - <<: *crop_cfg
-      apply_to: ${modality_config_g2.video.modality_keys}
-    - <<: *resize_cfg
-      apply_to: ${modality_config_g2.video.modality_keys}
-    - <<: *color_jitter_cfg
-      apply_to: ${modality_config_g2.video.modality_keys}
-    - <<: *to_numpy_cfg
-      apply_to: ${modality_config_g2.video.modality_keys}
-
-    - _target_: groot.vla.data.transform.StateActionToTensor
-      apply_to: ${modality_config_g2.state.modality_keys}
-    - _target_: groot.vla.data.transform.StateActionTransform
-      apply_to: ${modality_config_g2.state.modality_keys}
-      normalization_modes:
-        state.left_joint_position: q99
-        state.left_gripper_position: q99
-        state.right_joint_position: q99
-        state.right_gripper_position: q99
-
-    - _target_: groot.vla.data.transform.StateActionToTensor
-      apply_to: ${modality_config_g2.action.modality_keys}
-    - _target_: groot.vla.data.transform.StateActionTransform
-      apply_to: ${modality_config_g2.action.modality_keys}
-      normalization_modes:
-        action.left_joint_position: q99
-        action.left_gripper_position: q99
-        action.right_joint_position: q99
-        action.right_gripper_position: q99
-
-    - _target_: groot.vla.data.transform.ConcatTransform
-      video_concat_order: ${modality_config_g2.video.modality_keys}
-      state_concat_order: ${modality_config_g2.state.modality_keys}
-      action_concat_order: ${modality_config_g2.action.modality_keys}
-    - ${model_specific_transform}
-
 modality_configs:
   oxe_droid: ${modality_config_oxe_droid}
   agibot: ${modality_config_agibot}
   yam: ${modality_config_yam}
-  g2: ${modality_config_g2}
 
 ################################################################################
 # Transforms
@@ -522,7 +446,6 @@ transforms:
   oxe_droid: ${transform_oxe_droid}
   agibot: ${transform_agibot}
   yam: ${transform_yam}
-  g2: ${transform_g2}
 
 ################################################################################
 # Metadata Versions
@@ -532,7 +455,6 @@ metadata_versions:
   oxe_droid: '0221'
   agibot: '0221'
   yam: '0221'
-  g2: '0221'
 
 ################################################################################
 # FPS (per embodiment, null means use dataset default)
@@ -540,4 +462,3 @@ metadata_versions:
 
 fps:
   yam: 30
-  g2: 30

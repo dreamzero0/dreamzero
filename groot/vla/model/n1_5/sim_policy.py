@@ -254,6 +254,7 @@ class GrootSimPolicy(BaseGrootSimPolicy):
             model_target = train_cfg.model._target_
             
         self.model_target = model_target
+        action_adapter_path = model_dir / "action_expert.safetensors"
         
         if model_config_overrides is not None and len(model_config_overrides) != 0:
             print(f"Applying model config overrides: {model_config_overrides}")
@@ -277,9 +278,24 @@ class GrootSimPolicy(BaseGrootSimPolicy):
             model_config = model_config_class.from_dict(model_config)
 
             # Instantiate the model
-            if hasattr(train_cfg, "save_lora_only") and train_cfg.save_lora_only is True:
+            if action_adapter_path.exists():
+                print("Loading G2 action adapter on clean DreamZero base")
+                base_model_path = train_cfg.get("pretrained_model_path", None)
+                model = model_class.load_action_adapter(
+                    str(model_dir),
+                    pretrained_base_model_path=base_model_path,
+                    config=model_config,
+                )
+            elif hasattr(train_cfg, "save_lora_only") and train_cfg.save_lora_only is True:
                 print(f"Loading LoRA weights from pretrained")
-                model = model_class.load_lora(model_path)
+                base_model_path = train_cfg.get(
+                    "pretrained_model_path",
+                    None,
+                )
+                model = model_class.load_lora(
+                    model_path,
+                    pretrained_base_model_path=base_model_path,
+                )
             else:
                 print(f"Loading model from pretrained directly")
                 model = model_class.from_pretrained(model_path, config=model_config)
@@ -289,10 +305,25 @@ class GrootSimPolicy(BaseGrootSimPolicy):
             cls_module, cls_name = model_target.rsplit(".", 1)
             if 'lora' in cls_name:
                 cls_module, cls_name = cls_module.rsplit(".", 1)
-            if hasattr(train_cfg, "save_lora_only") and train_cfg.save_lora_only is True:
+            if action_adapter_path.exists():
+                print("Loading G2 action adapter on clean DreamZero base")
+                cls = getattr(importlib.import_module(cls_module), cls_name)
+                base_model_path = train_cfg.get("pretrained_model_path", None)
+                model = cls.load_action_adapter(
+                    str(model_dir),
+                    pretrained_base_model_path=base_model_path,
+                )
+            elif hasattr(train_cfg, "save_lora_only") and train_cfg.save_lora_only is True:
                 print(f"Loading LoRA weights from pretrained")
                 cls = getattr(importlib.import_module(cls_module), cls_name)
-                model = cls.load_lora(model_path)
+                base_model_path = train_cfg.get(
+                    "pretrained_model_path",
+                    None,
+                )
+                model = cls.load_lora(
+                    model_path,
+                    pretrained_base_model_path=base_model_path,
+                )
             else:
                 print(f"Loading model from pretrained directly")
                 cls = getattr(importlib.import_module(cls_module), cls_name)

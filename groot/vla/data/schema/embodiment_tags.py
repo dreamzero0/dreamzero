@@ -153,6 +153,8 @@ class EmbodimentTag(Enum):
     """
     AGIBOT = "agibot"
 
+    G2 = "g2"
+
     YAM = "yam"
 
     DREAM = "dream"

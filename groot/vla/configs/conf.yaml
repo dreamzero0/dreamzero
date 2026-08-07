@@ -33,6 +33,7 @@ trainer:
   profile_record_shapes: false                # record tensor shapes (adds overhead)
   profile_with_stack: false                   # record Python stack traces
   profile_memory: false                       # record memory allocation
+  milestone_save_steps: ${milestone_save_steps}
 
 # === Training Arguments ===
 
@@ -67,6 +68,7 @@ num_train_epochs: 1000
 max_steps: -1
 save_strategy: steps
 save_steps: 500
+milestone_save_steps: null
 eval_strategy: "no"  # there has to be a double quote; otherwise a bare `no` will be interpreted as False
 save_total_limit: 8
 report_to: wandb
@@ -80,6 +82,7 @@ eval_bf16: true
 torch_compile_mode: null
 
 pretrained_model_path: null
+pretrained_lora_path: null
 only_tune_projectors: false
 
 save_llm: false

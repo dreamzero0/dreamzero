@@ -128,6 +128,60 @@ class WANPolicyHeadConfig(PretrainedConfig):
     tune_diffusion_model: bool = field(
         default=True, metadata={"help": "Whether to tune the diffusion model."}
     )
+    action_only_training: bool = field(
+        default=False,
+        metadata={"help": "Freeze the shared DiT and train only state/action adapters."},
+    )
+    dynamics_loss_weight: float = field(
+        default=1.0, metadata={"help": "Multiplier for the video dynamics loss."}
+    )
+    action_loss_weight: float = field(
+        default=1.0, metadata={"help": "Multiplier for the action flow-matching loss."}
+    )
+    action_x0_loss_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": "Multiplier for direct decoded-action reconstruction loss."
+        },
+    )
+    action_endpoint_loss_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": "Multiplier for direct final-step action reconstruction loss."
+        },
+    )
+    action_start_loss_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": "Multiplier for the current-state start consistency loss "
+            "(first action of each chunk should be close to the current joint "
+            "state).  Soft anchor: state is a training target, not a model input."
+        },
+    )
+    action_video_consistency_loss_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": "Multiplier for the video->action consistency loss "
+            "(actions recovered from the predicted future video latent should "
+            "match the action chunk).  Increases the action's dependence on the "
+            "video/dynamics representation.  Keep small initially to avoid "
+            "disrupting flow-matching."
+        },
+    )
+    motion_mask_enabled: bool = field(
+        default=False,
+        metadata={"help": "Mask stationary action timesteps out of the action loss."},
+    )
+    motion_mask_threshold_rad: float = field(
+        default=0.03,
+        metadata={"help": "Joint movement threshold in radians for motion masking."},
+    )
+    motion_mask_stats_path: str | None = field(
+        default=None,
+        metadata={
+            "help": "Relative-action stats used to convert normalized action deltas to radians."
+        },
+    )
     load_pretrained_det_decode_layer_path: str = field(
         default=None, metadata={"help": "Path to pretrained detection model."}
     )
@@ -238,6 +292,13 @@ class WANPolicyHead(ActionHead):
         self.model = instantiate(config.diffusion_model_cfg)
         self.action_dim = config.action_dim
         self.action_horizon = config.action_horizon
+
+        # Optional video->action consistency head (created lazily on first
+        # forward once the video-latent channel count is known).  Recovering
+        # actions from the predicted future video latent makes the action
+        # depend on the learned implicit dynamics.
+        self.video_to_action_head: nn.Module | None = None
+        self._video_head_latent_channels: int | None = None
         self.num_inference_timesteps = config.num_inference_timesteps
         
         text_enc_path = ensure_file(
@@ -313,9 +374,128 @@ class WANPolicyHead(ActionHead):
         # self.num_timestep_buckets = config.num_timestep_buckets
         self.config = config
         self._noise_logged = False
+        self._loss_contract_logged = False
+        self._motion_mask_logged = False
         self.defer_lora_injection = config.defer_lora_injection
+        self._motion_mask_arm_ranges = self._load_motion_mask_arm_ranges(config)
         print("defer_lora_injection@@", self.defer_lora_injection)
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
+
+    @staticmethod
+    def _load_motion_mask_arm_ranges(config: WANPolicyHeadConfig) -> torch.Tensor | None:
+        """Load q99 normalization ranges for the 14 arm joints.
+
+        The action tensor reaching this head is q99-normalized. For a q99
+        transform, normalized_delta * (q99-q01) / 2 is the original action
+        delta, so the configured radian threshold remains meaningful without
+        changing the dataset or model inputs.
+        """
+        if not config.motion_mask_enabled:
+            return None
+
+        stats_path = config.motion_mask_stats_path
+        if not stats_path:
+            raise ValueError(
+                "motion_mask_stats_path is required when motion_mask_enabled=true"
+            )
+        if not os.path.isfile(stats_path):
+            raise FileNotFoundError(
+                f"Motion-mask stats file does not exist: {stats_path}"
+            )
+
+        with open(stats_path, "r", encoding="utf-8") as f:
+            stats = json.load(f)
+
+        ranges = []
+        for key in ("left_joint_position", "right_joint_position"):
+            key_stats = stats.get(key)
+            if key_stats is None:
+                raise KeyError(f"Missing {key} in motion-mask stats: {stats_path}")
+            q01 = key_stats.get("q01")
+            q99 = key_stats.get("q99")
+            if q01 is None or q99 is None or len(q01) != 7 or len(q99) != 7:
+                raise ValueError(
+                    f"Expected 7-dimensional q01/q99 stats for {key}: {stats_path}"
+                )
+            ranges.extend(float(high) - float(low) for low, high in zip(q01, q99))
+
+        ranges_tensor = torch.tensor(ranges, dtype=torch.float32)
+        if not torch.all(ranges_tensor > 0):
+            raise ValueError(
+                f"Motion-mask q99 ranges must be positive, got {ranges_tensor.tolist()}"
+            )
+        print(
+            "[MOTION MASK] enabled=true "
+            f"threshold_rad={config.motion_mask_threshold_rad:.4f} "
+            f"stats={stats_path}"
+        )
+        return ranges_tensor
+
+    def _build_motion_loss_mask(self, actions: torch.Tensor) -> torch.Tensor:
+        """Return a [B, T] mask for action timesteps involved in motion.
+
+        Actions are normalized before reaching this head, so use the loaded
+        q99 ranges to evaluate the 14-arm-joint delta in radians. The action
+        stream can contain multiple 24-step chunks; deltas never cross a
+        chunk boundary.
+        """
+        if self._motion_mask_arm_ranges is None:
+            raise RuntimeError("Motion-mask ranges were not initialized")
+        if actions.ndim != 3:
+            raise RuntimeError(f"Expected actions with shape [B,T,D], got {actions.shape}")
+
+        batch_size, action_steps, _ = actions.shape
+        if action_steps % self.action_horizon != 0:
+            raise RuntimeError(
+                f"Motion mask requires action length divisible by horizon "
+                f"{self.action_horizon}, got {action_steps}"
+            )
+
+        arm_indices = torch.tensor(
+            [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14],
+            device=actions.device,
+        )
+        num_chunks = action_steps // self.action_horizon
+        arm_actions = actions.index_select(dim=2, index=arm_indices).reshape(
+            batch_size, num_chunks, self.action_horizon, 14
+        )
+        delta_normalized = arm_actions[:, :, 1:] - arm_actions[:, :, :-1]
+        ranges = self._motion_mask_arm_ranges.to(
+            device=actions.device, dtype=actions.dtype
+        ).reshape(1, 1, 1, 14)
+        delta_rad = delta_normalized * ranges / 2.0
+        max_joint_move = delta_rad.abs().max(dim=-1).values
+        moving_transition = max_joint_move > float(self.config.motion_mask_threshold_rad)
+
+        # A transition contributes to both endpoints: this preserves the
+        # target immediately before movement and the target at the new pose.
+        motion_mask = torch.zeros(
+            batch_size,
+            num_chunks,
+            self.action_horizon,
+            dtype=actions.dtype,
+            device=actions.device,
+        )
+        motion_mask[:, :, :-1] = moving_transition.to(dtype=actions.dtype)
+        motion_mask[:, :, 1:] = torch.maximum(
+            motion_mask[:, :, 1:], moving_transition.to(dtype=actions.dtype)
+        )
+        motion_mask = motion_mask.reshape(batch_size, action_steps)
+
+        if not self._motion_mask_logged:
+            active_steps = motion_mask.sum().detach()
+            total_steps = torch.tensor(
+                motion_mask.numel(), dtype=motion_mask.dtype, device=motion_mask.device
+            )
+            print(
+                "[MOTION MASK] action_steps="
+                f"{action_steps} chunks={num_chunks} "
+                f"active_ratio={float(active_steps / total_steps.clamp_min(1.0)):.4f} "
+                f"active_steps={int(active_steps.item())}/{motion_mask.numel()}"
+            )
+            self._motion_mask_logged = True
+
+        return motion_mask
 
     def reset_inference_cache(self) -> None:
         self.kv_cache1 = None
@@ -344,7 +524,9 @@ class WANPolicyHead(ActionHead):
         if not any(p.requires_grad for p in self.parameters()):
             print("Warning: No action head trainable parameters found.")
 
-        if self.train_architecture == "lora" and not self.defer_lora_injection:
+        if self.train_architecture == "action_only":
+            self.configure_action_only_training()
+        elif self.train_architecture == "lora" and not self.defer_lora_injection:
             print("Adding LoRA to model")
             for p in self.parameters():
                 p.requires_grad = False
@@ -415,6 +597,53 @@ class WANPolicyHead(ActionHead):
             self.print_trainable_params()
         else:
             print("LoRA injection not needed (train_architecture != 'lora')")
+
+    def configure_action_only_training(self):
+        """Freeze the shared video DiT and tune only the three action adapters."""
+        if self.train_architecture != "action_only":
+            raise RuntimeError(
+                "action_only_training requires train_architecture=action_only, "
+                f"got {self.train_architecture!r}"
+            )
+        lora_parameters = [
+            name for name, _ in self.model.named_parameters()
+            if "lora_" in name
+        ]
+        if lora_parameters:
+            raise RuntimeError(
+                "Action-adapter-only training forbids shared DiT LoRA; "
+                f"found {len(lora_parameters)} LoRA parameters"
+            )
+        for parameter in self.parameters():
+            parameter.requires_grad = False
+        self.model.state_encoder.requires_grad_(True)
+        self.model.action_encoder.requires_grad_(True)
+        self.model.action_decoder.requires_grad_(True)
+        self.text_encoder.requires_grad_(False)
+        self.image_encoder.requires_grad_(False)
+        self.vae.requires_grad_(False)
+        allowed_fragments = (
+            "action_head.model.state_encoder.",
+            "action_head.model.action_encoder.",
+            "action_head.model.action_decoder.",
+        )
+        unexpected = [
+            name
+            for name, parameter in self.named_parameters()
+            if parameter.requires_grad
+            and not any(fragment in f"action_head.{name}" for fragment in allowed_fragments)
+        ]
+        if unexpected:
+            raise RuntimeError(
+                "Action-adapter trainable whitelist violation: "
+                + ", ".join(unexpected[:20])
+            )
+        print(
+            "[TRAINABLE WHITELIST] state_encoder, action_encoder, "
+            "action_decoder only"
+        )
+        print("[SHARED DIT LORA] disabled")
+        self.print_trainable_params()
 
     def set_frozen_modules_to_eval_mode(self):
         """
@@ -761,17 +990,298 @@ class WANPolicyHead(ActionHead):
             weighted_dynamics_loss = weight_dynamics.mean()
             
             if actions.numel() > 0:
-                action_loss_per_sample = torch.nn.functional.mse_loss(
+                action_loss_per_element = torch.nn.functional.mse_loss(
                     action_noise_pred.float(), training_target_action.float(), reduction='none'
-                ) * action_mask  # shape: [B, ...]
-                action_loss_per_sample = has_real_action[:, None].float() * action_loss_per_sample  # apply has_real_action
-                weight_action = action_loss_per_sample.mean(dim=2) * self.scheduler.training_weight(
+                )
+                valid_action_mask = action_mask.to(
+                    dtype=action_loss_per_element.dtype,
+                    device=action_loss_per_element.device,
+                )
+                # Do not divide G2's 16 valid dimensions by max_action_dim=32.
+                # The previous masked-then-mean reduction silently halved the
+                # G2 action objective because its padded dimensions are zero.
+                valid_dim_count = valid_action_mask.sum(dim=2).clamp_min(1.0)
+                valid_dims = int(valid_dim_count.max().item())
+                if self.config.action_only_training and valid_dims != 16:
+                    raise RuntimeError(
+                        "G2 action adapter requires exactly 16 valid action "
+                        f"dimensions, got {valid_dims}"
+                    )
+
+                arm_indices = torch.tensor(
+                    [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14],
+                    device=action_loss_per_element.device,
+                )
+                gripper_indices = torch.tensor(
+                    [7, 15],
+                    device=action_loss_per_element.device,
+                )
+                arm_element_loss = action_loss_per_element.index_select(
+                    dim=2, index=arm_indices
+                )
+                arm_mask = valid_action_mask.index_select(
+                    dim=2, index=arm_indices
+                )
+                gripper_element_loss = action_loss_per_element.index_select(
+                    dim=2, index=gripper_indices
+                )
+                gripper_mask = valid_action_mask.index_select(
+                    dim=2, index=gripper_indices
+                )
+                arm_loss = (
+                    arm_element_loss * arm_mask
+                ).sum(dim=2) / arm_mask.sum(dim=2).clamp_min(1.0)
+                gripper_loss = (
+                    gripper_element_loss * gripper_mask
+                ).sum(dim=2) / gripper_mask.sum(dim=2).clamp_min(1.0)
+                action_loss_per_timestep = (
+                    (14.0 / 16.0) * arm_loss
+                    + (2.0 / 16.0) * gripper_loss
+                )
+                action_loss_per_timestep = (
+                    has_real_action[:, None].float()
+                    * action_loss_per_timestep
+                )
+                if not self._loss_contract_logged:
+                    old_reduction = (
+                        action_loss_per_element * valid_action_mask
+                    ).mean(dim=2).mean().detach()
+                    corrected_reduction = (
+                        action_loss_per_timestep.mean().detach()
+                    )
+                    ratio = corrected_reduction / old_reduction.clamp_min(1e-12)
+                    print(
+                        "[ACTION LOSS CONTRACT] padded_action_dim="
+                        f"{action_loss_per_element.shape[2]} "
+                        f"valid_action_dim={valid_dims} "
+                        f"corrected_loss/old_loss={float(ratio):.4f}"
+                    )
+                    self._loss_contract_logged = True
+                weight_action = action_loss_per_timestep * self.scheduler.training_weight(
                     timestep_action.flatten(0, 1),
                 ).unflatten(0, (noise_action.shape[0], noise_action.shape[1])).to(self._device)
-                weighted_action_loss = weight_action.mean()
-                loss = weighted_dynamics_loss + weighted_action_loss
+                action_time_mask = has_real_action[:, None].float()
+                if self.config.motion_mask_enabled:
+                    action_time_mask = action_time_mask * self._build_motion_loss_mask(actions)
+                    weighted_action_loss = (
+                        weight_action * action_time_mask
+                    ).sum() / action_time_mask.sum().clamp_min(1.0)
+                else:
+                    weighted_action_loss = weight_action.mean()
+
+                # The flow-matching objective supervises the velocity/noise
+                # field. Add an optional direct x0 objective so the decoded
+                # action trajectory and its final pose are also constrained.
+                action_x0_loss = torch.tensor(0.0, device=self._device)
+                action_endpoint_loss = torch.tensor(0.0, device=self._device)
+                action_start_loss = torch.tensor(0.0, device=self._device)
+                if (
+                    float(self.config.action_x0_loss_weight) > 0.0
+                    or float(self.config.action_endpoint_loss_weight) > 0.0
+                    or float(self.config.action_start_loss_weight) > 0.0
+                ):
+                    sigma_action = self.scheduler.sigmas.to(
+                        device=noisy_actions.device, dtype=noisy_actions.dtype
+                    )[timestep_action_id.to(device=noisy_actions.device)].unsqueeze(-1)
+                    decoded_actions = (
+                        noisy_actions.float()
+                        - sigma_action.float() * action_noise_pred.float()
+                    )
+                    direct_action_element_loss = torch.nn.functional.smooth_l1_loss(
+                        decoded_actions,
+                        actions.float(),
+                        beta=0.05,
+                        reduction="none",
+                    )
+                    direct_arm_loss = (
+                        direct_action_element_loss.index_select(dim=2, index=arm_indices)
+                        * valid_action_mask.index_select(dim=2, index=arm_indices)
+                    ).sum(dim=2) / valid_action_mask.index_select(
+                        dim=2, index=arm_indices
+                    ).sum(dim=2).clamp_min(1.0)
+                    direct_gripper_loss = (
+                        direct_action_element_loss.index_select(
+                            dim=2, index=gripper_indices
+                        )
+                        * valid_action_mask.index_select(dim=2, index=gripper_indices)
+                    ).sum(dim=2) / valid_action_mask.index_select(
+                        dim=2, index=gripper_indices
+                    ).sum(dim=2).clamp_min(1.0)
+                    direct_action_per_timestep = (
+                        (14.0 / 16.0) * direct_arm_loss
+                        + (2.0 / 16.0) * direct_gripper_loss
+                    )
+                    direct_action_per_timestep = (
+                        has_real_action[:, None].float()
+                        * direct_action_per_timestep
+                    )
+                    action_x0_loss = (
+                        direct_action_per_timestep * action_time_mask
+                    ).sum() / action_time_mask.sum().clamp_min(1.0)
+
+                    if float(self.config.action_endpoint_loss_weight) > 0.0:
+                        if actions.shape[1] % self.action_horizon != 0:
+                            raise RuntimeError(
+                                "Endpoint action loss requires action length divisible "
+                                f"by horizon {self.action_horizon}, got {actions.shape[1]}"
+                            )
+                        num_chunks = actions.shape[1] // self.action_horizon
+                        decoded_chunks = decoded_actions.reshape(
+                            actions.shape[0], num_chunks, self.action_horizon, -1
+                        )
+                        target_chunks = actions.float().reshape(
+                            actions.shape[0], num_chunks, self.action_horizon, -1
+                        )
+                        valid_chunks = valid_action_mask.reshape(
+                            actions.shape[0], num_chunks, self.action_horizon, -1
+                        )
+                        endpoint_element_loss = torch.nn.functional.smooth_l1_loss(
+                            decoded_chunks[:, :, -1],
+                            target_chunks[:, :, -1],
+                            beta=0.05,
+                            reduction="none",
+                        )
+                        endpoint_valid = valid_chunks[:, :, -1]
+                        endpoint_arm_loss = (
+                            endpoint_element_loss.index_select(dim=2, index=arm_indices)
+                            * endpoint_valid.index_select(dim=2, index=arm_indices)
+                        ).sum(dim=2) / endpoint_valid.index_select(
+                            dim=2, index=arm_indices
+                        ).sum(dim=2).clamp_min(1.0)
+                        endpoint_gripper_loss = (
+                            endpoint_element_loss.index_select(
+                                dim=2, index=gripper_indices
+                            )
+                            * endpoint_valid.index_select(dim=2, index=gripper_indices)
+                        ).sum(dim=2) / endpoint_valid.index_select(
+                            dim=2, index=gripper_indices
+                        ).sum(dim=2).clamp_min(1.0)
+                        endpoint_per_chunk = (
+                            (14.0 / 16.0) * endpoint_arm_loss
+                            + (2.0 / 16.0) * endpoint_gripper_loss
+                        )
+                        endpoint_chunk_mask = action_time_mask.reshape(
+                            actions.shape[0], num_chunks, self.action_horizon
+                        ).amax(dim=2)
+                        action_endpoint_loss = (
+                            endpoint_per_chunk * endpoint_chunk_mask
+                        ).sum() / endpoint_chunk_mask.sum().clamp_min(1.0)
+
+                # Current-state start consistency (L_start): the FIRST predicted
+                # action should be close to the current joint state.  state is a
+                # TRAINING TARGET here, not a model input, so this anchors the
+                # model's trajectory to the true start pose without re-enabling
+                # the state-input shortcut.  Only the sequence-start state is
+                # available, so the anchor applies to the first action step.
+                if float(self.config.action_start_loss_weight) > 0.0:
+                    # action is padded to action_dim (32), state to
+                    # max_state_dim (64); compare only the valid G2 dims (16).
+                    start_pred = decoded_actions[:, 0, :16]   # (B, 16)
+                    state_0 = state_features[:, 0, :16]       # (B, 16)
+                    start_element = torch.nn.functional.smooth_l1_loss(
+                        start_pred.float(), state_0.float(), beta=0.05, reduction="none"
+                    )
+                    start_valid = valid_action_mask[:, 0]
+                    start_arm = (
+                        start_element.index_select(dim=1, index=arm_indices)
+                        * start_valid.index_select(dim=1, index=arm_indices)
+                    ).sum(dim=1) / start_valid.index_select(
+                        dim=1, index=arm_indices
+                    ).sum(dim=1).clamp_min(1.0)
+                    start_grip = (
+                        start_element.index_select(dim=1, index=gripper_indices)
+                        * start_valid.index_select(dim=1, index=gripper_indices)
+                    ).sum(dim=1) / start_valid.index_select(
+                        dim=1, index=gripper_indices
+                    ).sum(dim=1).clamp_min(1.0)
+                    start_per_sample = (
+                        (14.0 / 16.0) * start_arm + (2.0 / 16.0) * start_grip
+                    )
+                    action_start_loss = (
+                        start_per_sample * has_real_action.float()
+                    ).sum() / has_real_action.sum().clamp_min(1.0)
+
+                # Video->action consistency (L_video_to_action): recover the
+                # action from the PREDICTED clean video latent so the action
+                # chunk depends on the learned implicit dynamics encoded in the
+                # video.  Implemented defensively: if the latent/head shapes are
+                # not as expected the term is skipped (logged) instead of
+                # crashing the run.
+                action_video_consistency_loss = torch.tensor(0.0, device=self._device)
+                if float(self.config.action_video_consistency_loss_weight) > 0.0 and actions.numel() > 0:
+                    try:
+                        sigma_video = self.scheduler.sigmas.to(
+                            device=noisy_latents.device, dtype=noisy_latents.dtype
+                        )[timestep_id.to(device=noisy_latents.device)]
+                        while sigma_video.ndim < noisy_latents.ndim:
+                            sigma_video = sigma_video.unsqueeze(-1)
+                        decoded_latents = (
+                            noisy_latents.float() - sigma_video.float() * video_noise_pred.float()
+                        )
+                        # pool spatial + time, keep channel dim (dim 1)
+                        pooled = decoded_latents.mean(dim=tuple(range(2, decoded_latents.ndim)))
+                        if self.video_to_action_head is None:
+                            self._video_head_latent_channels = int(pooled.shape[1])
+                            self.video_to_action_head = nn.Linear(
+                                self._video_head_latent_channels, self.action_dim
+                            ).to(device=pooled.device, dtype=pooled.dtype)
+                        pred_action = self.video_to_action_head(pooled.float())
+                        vid_element = torch.nn.functional.mse_loss(
+                            pred_action, actions[:, 0].float(), reduction="none"
+                        )
+                        vid_valid = valid_action_mask[:, 0]
+                        vid_arm = (
+                            vid_element.index_select(dim=1, index=arm_indices)
+                            * vid_valid.index_select(dim=1, index=arm_indices)
+                        ).sum(dim=1) / vid_valid.index_select(
+                            dim=1, index=arm_indices
+                        ).sum(dim=1).clamp_min(1.0)
+                        vid_grip = (
+                            vid_element.index_select(dim=1, index=gripper_indices)
+                            * vid_valid.index_select(dim=1, index=gripper_indices)
+                        ).sum(dim=1) / vid_valid.index_select(
+                            dim=1, index=gripper_indices
+                        ).sum(dim=1).clamp_min(1.0)
+                        vid_per_sample = (
+                            (14.0 / 16.0) * vid_arm + (2.0 / 16.0) * vid_grip
+                        )
+                        action_video_consistency_loss = (
+                            vid_per_sample * has_real_action.float()
+                        ).sum() / has_real_action.sum().clamp_min(1.0)
+                    except Exception as exc:  # noqa: BLE001 - defensive skip
+                        logging.warning(
+                            "video->action consistency loss skipped (%s); "
+                            "check latent/head shapes.",
+                            exc,
+                        )
+
+                action_objective = (
+                    float(self.config.action_loss_weight) * weighted_action_loss
+                    + float(self.config.action_x0_loss_weight) * action_x0_loss
+                    + float(self.config.action_endpoint_loss_weight)
+                    * action_endpoint_loss
+                    + float(self.config.action_start_loss_weight) * action_start_loss
+                    + float(self.config.action_video_consistency_loss_weight)
+                    * action_video_consistency_loss
+                )
+                if self.config.action_only_training:
+                    loss = action_objective
+                    weighted_dynamics_loss = weighted_dynamics_loss.detach()
+                else:
+                    loss = (
+                        float(self.config.dynamics_loss_weight)
+                        * weighted_dynamics_loss
+                        + action_objective
+                    )
             else:
                 weighted_action_loss = torch.tensor(0.0, device=self._device)
+                action_x0_loss = torch.tensor(0.0, device=self._device)
+                action_endpoint_loss = torch.tensor(0.0, device=self._device)
+                if self.config.action_only_training:
+                    raise RuntimeError(
+                        "Action-adapter-only training received an empty action "
+                        "tensor; refusing to optimize video loss"
+                    )
                 loss = weighted_dynamics_loss
             # loss = dynamics_loss_per_sample.mean()
 
@@ -780,6 +1290,10 @@ class WANPolicyHead(ActionHead):
             "loss": loss,
             "dynamics_loss": weighted_dynamics_loss,
             "action_loss": weighted_action_loss,
+            "action_x0_loss": action_x0_loss,
+            "action_endpoint_loss": action_endpoint_loss,
+            "action_start_loss": action_start_loss,
+            "action_video_consistency_loss": action_video_consistency_loss,
         }
 
         return BatchFeature(data=output_dict)

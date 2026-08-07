@@ -16,7 +16,7 @@ PYTHON_BIN="${PYTHON_BIN:-/home/user/miniconda3/envs/dreamzero/bin/python}"
 PORT="${PORT:-9443}"
 NUM_GPUS="${NUM_GPUS:-2}"
 CUDA_VISIBLE_DEVICES_VALUE="${CUDA_VISIBLE_DEVICES:-0,1}"
-MODEL_PATH="${MODEL_PATH:-/data1/wangk/checkpoints/DreamZero-AgiBot}"
+MODEL_PATH="${MODEL_PATH:-/data/wangk/checkpoints/DreamZero-AgiBot}"
 VIDEO_SAVE_MODE="${VIDEO_SAVE_MODE:-full}"
 NUM_INFERENCE_TIMESTEPS="${NUM_INFERENCE_TIMESTEPS:-0}"
 

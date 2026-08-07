@@ -101,7 +101,10 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
                         # If it's already a scalar (string, float, int, etc.), convert to string
                         processed_item = str(parsed_item)
                     
-                    if num_views > 1 and elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.AGIBOT.value]:
+                    if num_views > 1 and elem["embodiment_id"] in (
+                        embodiment_tag_mapping.get(EmbodimentTag.AGIBOT.value),
+                        embodiment_tag_mapping.get(EmbodimentTag.G2.value),
+                    ):
                         processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + processed_item.lower()
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.OXE_DROID.value]:
                         processed_item = (
@@ -123,7 +126,10 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
                     output_values.append(processed_item)  
                 except (ValueError, SyntaxError, TypeError):
                     # If parsing fails or item is already a string, use it directly
-                    if num_views > 1 and elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.AGIBOT.value]:
+                    if num_views > 1 and elem["embodiment_id"] in (
+                        embodiment_tag_mapping.get(EmbodimentTag.AGIBOT.value),
+                        embodiment_tag_mapping.get(EmbodimentTag.G2.value),
+                    ):
                         item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + str(item).lower()
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.OXE_DROID.value]:
                         item = (

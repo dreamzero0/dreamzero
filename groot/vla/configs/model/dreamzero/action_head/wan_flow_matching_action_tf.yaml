@@ -38,7 +38,7 @@ action_head_cfg:
     model_dtype: float32
     max_state_dim: ${max_state_dim}
     max_action_dim: ${max_action_dim}
-    action_loss_embodiment_ids: [26, 17, 32]
+    action_loss_embodiment_ids: [26, 17, 32, 33]
     hidden_size: ${hidden_size}
     input_embedding_dim: 1536
     backbone_embedding_dim: ${backbone_hidden_size}
@@ -106,3 +106,12 @@ action_head_cfg:
 
     tune_projector: true
     tune_diffusion_model: true
+    action_only_training: false
+    dynamics_loss_weight: 1.0
+    action_loss_weight: 1.0
+    # Auxiliary action constraints (keep small to avoid disrupting flow-matching):
+    #   L_start: first action of the chunk anchors to the current joint state.
+    #   L_video_to_action: actions recovered from predicted video latent must
+    #     match the action chunk (action depends on implicit dynamics).
+    action_start_loss_weight: 0.05
+    action_video_consistency_loss_weight: 0.10

@@ -7,6 +7,7 @@ import hydra
 import numpy as np
 from omegaconf import DictConfig
 import torch
+from transformers import TrainerCallback
 
 from groot.vla.experiment.base import BaseExperiment, BaseTrainer
 from groot.vla.utils.action_args_override_utils import apply_action_overrides
@@ -15,6 +16,18 @@ logger = logging.getLogger(__name__)
 
 
 INITIAL_ACTIONS_FILENAME = "initial_actions.npz"
+
+
+class MilestoneSaveCallback(TrainerCallback):
+    """Request checkpoints only at configured optimizer-step milestones."""
+
+    def __init__(self, milestones):
+        self.milestones = frozenset(int(step) for step in milestones)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step in self.milestones:
+            control.should_save = True
+        return control
 
 
 class ForceRestart(ValueError):
@@ -35,8 +48,16 @@ class VLATrainer(BaseTrainer):
         self.rank = dist.get_rank()
 
         self.micro_global_step = 0
+        milestones = kwargs.pop("milestone_save_steps", None)
 
         super().__init__(**kwargs)
+        if milestones:
+            self.add_callback(MilestoneSaveCallback(milestones))
+            if self.rank == 0:
+                print(
+                    "[CHECKPOINT MILESTONES] "
+                    + ",".join(str(int(step)) for step in milestones)
+                )
 
     def training_step(self, model, inputs, *args, **kwargs):
         self.micro_global_step += 1

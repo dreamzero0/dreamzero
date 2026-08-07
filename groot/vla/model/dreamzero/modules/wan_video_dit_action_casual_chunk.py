@@ -197,7 +197,8 @@ class CausalWanSelfAttention(nn.Module):
                  qk_norm=True,
                  eps=1e-6,
                  num_action_per_block=32,
-                 num_state_per_block=1):
+                 num_state_per_block=1,
+                 cut_state_attention=True):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -212,6 +213,7 @@ class CausalWanSelfAttention(nn.Module):
         self.frame_seqlen = frame_seqlen
         self.num_action_per_block = num_action_per_block
         self.num_state_per_block = num_state_per_block
+        self.cut_state_attention = cut_state_attention
         # layers
         self.q = nn.Linear(dim, dim)
         self.k = nn.Linear(dim, dim)
@@ -479,7 +481,11 @@ class CausalWanSelfAttention(nn.Module):
         state_block_starts = [state_start + i * num_state_per_block for i in range(num_state_blocks)]
         state_block_ends = [state_start + (i + 1) * num_state_per_block for i in range(num_state_blocks)]
         
-        # Process each image block
+        # Process each image block.
+        # Context: first image + image blocks + current action block (joint
+        # video<->action dynamics). When cut_state_attention=True (default) state
+        # is NOT in the context: it only conditions the shared blocks via the e0
+        # modulation. When False, state joins the context.
         for block_idx in range(num_image_blocks):
             block_start = image_block_starts[block_idx]
             block_end = image_block_ends[block_idx]
@@ -488,53 +494,61 @@ class CausalWanSelfAttention(nn.Module):
             action_block_end = action_block_ends[block_idx]
             state_block_start = state_block_starts[block_idx]
             state_block_end = state_block_ends[block_idx]
-            
-            # Build context: first image + relevant image blocks + current action + current state
-            k_context = torch.cat([
+
+            k_parts = [
                 k[:, first_image_start:first_image_end],  # First image
                 k[:, image_kv_start:block_end],  # Image blocks
                 k[:, action_block_start:action_block_end],  # Current action block
-                k[:, state_block_start:state_block_end]  # Current state block
-            ], dim=1)
-            v_context = torch.cat([
+            ]
+            v_parts = [
                 v[:, first_image_start:first_image_end],
                 v[:, image_kv_start:block_end],
                 v[:, action_block_start:action_block_end],
-                v[:, state_block_start:state_block_end]
-            ], dim=1)
-            
+            ]
+            if not self.cut_state_attention:
+                k_parts.append(k[:, state_block_start:state_block_end])
+                v_parts.append(v[:, state_block_start:state_block_end])
+            k_context = torch.cat(k_parts, dim=1)
+            v_context = torch.cat(v_parts, dim=1)
+
             output[:, block_start:block_end] = self.attn(
                 q[:, block_start:block_end], k_context, v_context
             )
-        
-        # Process each action block
+
+        # Process each action block.
+        # Context: first image + image blocks + current action block. When
+        # cut_state_attention=True (default) state is NOT in the action context —
+        # the action chunk must be driven by the future video, not by a direct
+        # current-state copy. When False, state joins the context.
         for block_idx in range(num_action_blocks):
             action_block_start = action_block_starts[block_idx]
             action_block_end = action_block_ends[block_idx]
             image_block_end = image_block_ends[block_idx]
             state_block_start = state_block_starts[block_idx]
             state_block_end = state_block_ends[block_idx]
-            
+
             # Determine image context range
             if self.local_attn_size != -1:
                 image_kv_start = max(image_blocks_start, image_block_end - self.local_attn_size * frame_seqlen)
             else:
                 image_kv_start = image_blocks_start
-            
-            # Build context
-            k_context = torch.cat([
+
+            k_parts = [
                 k[:, first_image_start:first_image_end],  # First image
                 k[:, image_kv_start:image_block_end],  # Image blocks
                 k[:, action_block_start:action_block_end],  # Current action block
-                k[:, state_block_start:state_block_end]  # Current state block
-            ], dim=1)
-            v_context = torch.cat([
+            ]
+            v_parts = [
                 v[:, first_image_start:first_image_end],
                 v[:, image_kv_start:image_block_end],
                 v[:, action_block_start:action_block_end],
-                v[:, state_block_start:state_block_end]
-            ], dim=1)
-            
+            ]
+            if not self.cut_state_attention:
+                k_parts.append(k[:, state_block_start:state_block_end])
+                v_parts.append(v[:, state_block_start:state_block_end])
+            k_context = torch.cat(k_parts, dim=1)
+            v_context = torch.cat(v_parts, dim=1)
+
             output[:, action_block_start:action_block_end] = self.attn(
                 q[:, action_block_start:action_block_end], k_context, v_context
             )
@@ -693,8 +707,13 @@ class CausalWanSelfAttention(nn.Module):
         action_block_ends = [start + self.num_action_per_block for start in action_block_starts]
         state_block_starts = [i * self.num_state_per_block for i in range(num_blocks)]
         state_block_ends = [start + self.num_state_per_block for start in state_block_starts]
-        
-        # Process noisy image blocks
+
+        # Process noisy image blocks.
+        # Context: first_clean_frame + clean_blocks[0:i] + current_noisy_block + action[i].
+        # When cut_state_attention=True (default), state is NOT part of the video
+        # context: the video branch is its own dynamics model conditioned on the
+        # shared blocks (state enters via e0), and state must not leak into the
+        # future-video prediction either. When False, state joins the context.
         for block_idx in range(num_blocks):
             noisy_start = noisy_block_starts[block_idx]
             noisy_end = noisy_block_ends[block_idx]
@@ -703,23 +722,25 @@ class CausalWanSelfAttention(nn.Module):
             action_end = action_block_ends[block_idx]
             state_start = state_block_starts[block_idx]
             state_end = state_block_ends[block_idx]
-            
+
             q_block = noisy_image_q[:, noisy_start:noisy_end]
-            
-            # Build context: first_clean_frame + clean_blocks[0:i] + current_noisy_block + action[i] + state[i]
-            k_context = torch.cat([
+
+            k_parts = [
                 clean_image_k[:, :clean_end],
                 noisy_image_k[:, noisy_start:noisy_end],
                 noisy_action_k[:, action_start:action_end],
-                noisy_state_k[:, state_start:state_end]
-            ], dim=1)
-            v_context = torch.cat([
+            ]
+            v_parts = [
                 clean_image_v[:, :clean_end],
                 noisy_image_v[:, noisy_start:noisy_end],
                 noisy_action_v[:, action_start:action_end],
-                noisy_state_v[:, state_start:state_end]
-            ], dim=1)
-            
+            ]
+            if not self.cut_state_attention:
+                k_parts.append(noisy_state_k[:, state_start:state_end])
+                v_parts.append(noisy_state_v[:, state_start:state_end])
+            k_context = torch.cat(k_parts, dim=1)
+            v_context = torch.cat(v_parts, dim=1)
+
             output[:, noisy_start:noisy_end] = self.attn(q_block, k_context, v_context)
         
         return output
@@ -752,8 +773,13 @@ class CausalWanSelfAttention(nn.Module):
         noisy_image_block_ends = [start + self.frame_seqlen * self.num_frame_per_block for start in noisy_image_block_starts]
         state_block_starts = [i * self.num_state_per_block for i in range(num_blocks)]
         state_block_ends = [start + self.num_state_per_block for start in state_block_starts]
-        
-        # Process noisy action blocks
+
+        # Process noisy action blocks.
+        # Context: first_clean_frame + clean_blocks[0:i] + noisy_image[i] + action[i].
+        # When cut_state_attention=True (default), state is NOT part of the action
+        # context: the action chunk must derive "what happens next" from the future
+        # video, not from a raw current-state copy. State only conditions the shared
+        # blocks via e0. When False, the original state-in-context behavior returns.
         for block_idx in range(num_blocks):
             action_start = action_block_starts[block_idx]
             action_end = action_block_ends[block_idx]
@@ -762,23 +788,25 @@ class CausalWanSelfAttention(nn.Module):
             noisy_img_end = noisy_image_block_ends[block_idx]
             state_start = state_block_starts[block_idx]
             state_end = state_block_ends[block_idx]
-            
+
             q_block = noisy_action_q[:, action_start:action_end]
-            
-            # Build context: first_clean_frame + clean_blocks[0:i] + noisy_image[i] + action[i] + state[i]
-            k_context = torch.cat([
+
+            k_parts = [
                 clean_image_k[:, :clean_end],
                 noisy_image_k[:, noisy_img_start:noisy_img_end],
                 noisy_action_k[:, action_start:action_end],
-                noisy_state_k[:, state_start:state_end]
-            ], dim=1)
-            v_context = torch.cat([
+            ]
+            v_parts = [
                 clean_image_v[:, :clean_end],
                 noisy_image_v[:, noisy_img_start:noisy_img_end],
                 noisy_action_v[:, action_start:action_end],
-                noisy_state_v[:, state_start:state_end]
-            ], dim=1)
-            
+            ]
+            if not self.cut_state_attention:
+                k_parts.append(noisy_state_k[:, state_start:state_end])
+                v_parts.append(noisy_state_v[:, state_start:state_end])
+            k_context = torch.cat(k_parts, dim=1)
+            v_context = torch.cat(v_parts, dim=1)
+
             output[:, action_start:action_end] = self.attn(q_block, k_context, v_context)
         
         return output
@@ -1099,7 +1127,8 @@ class CausalWanAttentionBlock(nn.Module):
                  cross_attn_norm=False,
                  eps=1e-6,
                  num_action_per_block=32,
-                 num_state_per_block=1):
+                 num_state_per_block=1,
+                 cut_state_attention=True):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -1122,6 +1151,7 @@ class CausalWanAttentionBlock(nn.Module):
             eps=eps,
             num_action_per_block=num_action_per_block,
             num_state_per_block=num_state_per_block,
+            cut_state_attention=cut_state_attention,
         )
         self.norm3 = WanLayerNorm(
             dim, eps,
@@ -1253,7 +1283,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  hidden_size=1024,
                  diffusion_model_pretrained_path=None,
                  num_action_per_block=32,
-                 num_state_per_block=1):
+                 num_state_per_block=1,
+                 state_dropout=0.0,
+                 cut_state_attention=True):
         r"""
         Initialize the diffusion model backbone.
 
@@ -1342,6 +1374,24 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             output_dim=action_dim,
         )
 
+        # State conditioning (AdaLN-style). The current proprioceptive state is
+        # encoded once into a moderate bottleneck and added to the per-block
+        # condition embedding `e0`. This symmetrically conditions BOTH video and
+        # action tokens through the shared DiT blocks. State never appears as
+        # register tokens that action can attend to, and there is no additive
+        # state->action path in the output heads.
+        self.state_cond_proj = nn.Sequential(
+            nn.Linear(max_state_dim, 256),
+            nn.SiLU(),
+            nn.Linear(256, dim * 6),
+        )
+        self.state_dropout = state_dropout
+        # When True, action/video attention excludes the state register segment
+        # (state only conditions via the e0 AdaLN modulation). The state token
+        # structure/shape is preserved; the register state slots are zeroed so
+        # they cannot act as an attention shortcut.
+        self.cut_state_attention = cut_state_attention
+
         # embeddings
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size)
@@ -1359,7 +1409,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.blocks = nn.ModuleList([
             CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads, frame_seqlen,
                                     self.local_attn_size, sink_size, num_frame_per_block, qk_norm, cross_attn_norm, eps,
-                                    num_action_per_block, num_state_per_block)
+                                    num_action_per_block, num_state_per_block,
+                                    cut_state_attention=self.cut_state_attention)
             for _ in range(num_layers)
         ])
 
@@ -1383,6 +1434,12 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # initialize weights
         self.init_weights()
 
+        # Zero-init the state conditioning's output projection so the initial
+        # AdaLN state modulation is ~0 (training starts video-driven; the state
+        # conditioning grows only if it helps).
+        nn.init.zeros_(self.state_cond_proj[-1].weight)
+        nn.init.zeros_(self.state_cond_proj[-1].bias)
+
         self.gradient_checkpointing = True
         self.independent_first_frame = False if self.num_frame_per_block == 1 else True
 
@@ -1393,7 +1450,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
     @staticmethod
     def _prepare_blockwise_causal_attn_mask(
         device: torch.device | str, num_frames: int = 21,
-        frame_seqlen: int = 1560, num_frame_per_block=1, local_attn_size=-1, action_horizon=1, state_horizon=1, num_action_per_block=30, num_state_per_block=1
+        frame_seqlen: int = 1560, num_frame_per_block=1, local_attn_size=-1, action_horizon=1, state_horizon=1, num_action_per_block=30, num_state_per_block=1,
+        cut_state_attention: bool = True
     ) -> BlockMask:
         """
         We will divide the token sequence into the following format:
@@ -1498,16 +1556,25 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             image_to_first = q_is_image_block & kv_is_first_image  # Image block to first image: always allowed
             image_to_image = q_is_image_block & kv_is_image_block & (kv_block <= q_block)  # Image block to image block: can attend to current and previous image blocks
             image_to_action = q_is_image_block & kv_is_action & (kv_block == q_block)  # Image block to action: can attend to current action block
-            image_to_state = q_is_image_block & kv_is_state & (kv_block == q_block)  # Image block to state: can attend to current state block
-            
+            # When cut_state_attention=True, the state edges are removed: neither
+            # video nor action may read the state register directly; state only
+            # conditions the shared blocks via the e0 AdaLN modulation.
+            image_to_state = (
+                (not cut_state_attention)
+                and q_is_image_block and kv_is_state and (kv_block == q_block)
+            )
+
             image_block_mask = image_to_first | image_to_image | image_to_action | image_to_state
-            
+
             # Action query
             action_to_image = q_is_action & kv_is_image_block & (kv_block <= q_block)  # Action to image block: can attend to current and all previous image blocks
             action_to_action = q_is_action & kv_is_action & (kv_block == q_block)  # Action to action: only same block
-            action_to_state = q_is_action & kv_is_state & (kv_block == q_block)  # Action to state: only same block
+            action_to_state = (
+                (not cut_state_attention)
+                and q_is_action and kv_is_state and (kv_block == q_block)
+            )  # Action to state: only same block (disabled when cut_state_attention)
             action_to_first = q_is_action & kv_is_first_image  # Action to first image: always allowed
-            
+
             action_mask = action_to_image | action_to_action | action_to_state | action_to_first
             
             # State query (conditioning) - cannot attend to anything
@@ -1714,7 +1781,14 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if action is not None:
             embodiment_id = torch.tensor([0], device=x.device).repeat(x.shape[0])
             action_features = self.action_encoder(action, timestep_action, embodiment_id)
-            state_features = self.state_encoder(state, embodiment_id)
+            # State no longer enters the DiT sequence as register tokens that
+            # video/action could attend to (that was the shortcut). The register
+            # state slots are zeroed; real state influence is injected as an
+            # AdaLN-style modulation on `e0` below.
+            state_features = torch.zeros(
+                (state.shape[0], state.shape[1], self.dim),
+                device=action_features.device, dtype=action_features.dtype,
+            )
             action_register = torch.cat([action_features, state_features], dim=1)
             action_length = action_features.shape[1]
             action_register_length = action_register.shape[1]
@@ -1740,6 +1814,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         e = e.unflatten(dim=0, sizes=(B, -1))
         e0 = self.time_projection(e)
         e0 = e0.unflatten(dim=2, sizes=(6, self.dim))
+
+        # Proprioceptive state is intentionally NOT used in this model variant:
+        # the register state slots are zeroed, attention edges are cut
+        # (cut_state_attention), and no AdaLN state modulation / dropout is
+        # applied. The action chunk must be predicted purely from the video.
 
         # context
         context = self.text_embedding(context)
@@ -2011,7 +2090,14 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             embodiment_id = torch.tensor([0]).repeat(x.shape[0]).to(device=embodiment_id.device)
             action_features = self.action_encoder(action, timestep_action, embodiment_id)
             action_length = action_features.shape[1]
-            state_features = self.state_encoder(state, embodiment_id)
+            # State no longer enters the DiT sequence as register tokens that
+            # video/action could attend to (that was the shortcut). The register
+            # state slots are zeroed; real state influence is injected as an
+            # AdaLN-style modulation on `e0` below.
+            state_features = torch.zeros(
+                (state.shape[0], state.shape[1], self.dim),
+                device=action_features.device, dtype=action_features.dtype,
+            )
             action_register = torch.cat([action_features, state_features], dim=1)
             action_register_length = action_register.shape[1]
             x = torch.cat([x, action_register], dim=1)
@@ -2038,6 +2124,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         e = e.unflatten(dim=0, sizes=(B, -1))
         e0 = self.time_projection(e)
         e0 = e0.unflatten(dim=2, sizes=(6, self.dim))
+
+        # Proprioceptive state is intentionally NOT used in this model variant:
+        # the register state slots are zeroed, attention edges are cut
+        # (cut_state_attention), and no AdaLN state modulation / dropout is
+        # applied. The action chunk must be predicted purely from the video.
 
         # context
         assert context.shape[1] == self.text_len

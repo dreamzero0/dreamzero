@@ -144,6 +144,11 @@ class CheckpointFormatCallback(TrainerCallback):
                 print(f"Copying wandb_config.json from {wandb_config_src} to {wandb_config_dst}")
                 shutil.copy2(wandb_config_src, wandb_config_dst)
 
+            trainer_state = checkpoint_dir / "trainer_state.json"
+            training_state = checkpoint_dir / "training_state.json"
+            if trainer_state.exists():
+                shutil.copy2(trainer_state, training_state)
+
 
 class ProfCallback(transformers.TrainerCallback):
     """Callback to manage PyTorch profiler during training.
@@ -481,14 +486,77 @@ class BaseTrainer(transformers.Trainer):
         else:
             state_dict = self.model.state_dict()
 
-        if self.base_cfg.save_lora_only:
-            # Save only the trainable parameters
-            train_key = [k for k, v in self.model.named_parameters() if v.requires_grad]
-            lora_state_dict = {k: v for k, v in self.model.state_dict().items() if k in train_key}
+        action_head_config = getattr(
+            getattr(self.model, "action_head", None),
+            "config",
+            None,
+        )
+        action_only_training = bool(
+            getattr(action_head_config, "action_only_training", False)
+        )
+
+        if action_only_training:
+            adapter_prefixes = (
+                "action_head.model.state_encoder.",
+                "action_head.model.action_encoder.",
+                "action_head.model.action_decoder.",
+            )
+            adapter_state_dict = {
+                key: value
+                for key, value in state_dict.items()
+                if key.startswith(adapter_prefixes)
+            }
+            expected_adapter_keys = {
+                key
+                for key in self.model.state_dict()
+                if key.startswith(adapter_prefixes)
+            }
+            if set(adapter_state_dict) != expected_adapter_keys:
+                missing = sorted(
+                    expected_adapter_keys - set(adapter_state_dict)
+                )
+                unexpected = sorted(
+                    set(adapter_state_dict) - expected_adapter_keys
+                )
+                raise RuntimeError(
+                    "Action adapter save contract mismatch: "
+                    f"missing={missing[:20]} unexpected={unexpected[:20]}"
+                )
+            state_dict = adapter_state_dict
+        elif self.base_cfg.save_lora_only:
+            # Save trainable parameters. During the action-only second stage,
+            # also retain the frozen stage-1 LoRA tensors: inference needs
+            # those adapters to preserve the already-recovered video model.
+            train_key = {
+                k for k, v in self.model.named_parameters() if v.requires_grad
+            }
+            lora_state_dict = {
+                k: v
+                for k, v in self.model.state_dict().items()
+                if k in train_key
+            }
             state_dict = lora_state_dict
 
         if self.args.should_save:
             ret = self.model.save_pretrained(output_dir, state_dict=state_dict)
+            if action_only_training:
+                from safetensors.torch import save_file
+
+                action_adapter_path = os.path.join(
+                    output_dir,
+                    "action_expert.safetensors",
+                )
+                save_file(
+                    {
+                        key: value.detach().cpu().contiguous()
+                        for key, value in state_dict.items()
+                    },
+                    action_adapter_path,
+                )
+                print(
+                    "[ACTION ADAPTER SAVE] "
+                    f"{action_adapter_path} keys={len(state_dict)}"
+                )
 
             # can separately save the VLM model for downstream evalualtion
             if self.base_cfg.save_llm:
@@ -701,6 +769,20 @@ class BaseExperiment(ABC):
             safetensors_index_path = os.path.join(ckpt_dir, "model.safetensors.index.json")
             safetensors_path = os.path.join(ckpt_dir, "model.safetensors")
 
+            model_state = model.state_dict()
+            loaded_base_keys = set()
+            skipped_base_keys = set()
+
+            def load_compatible_base_weights(weights):
+                compatible = {}
+                for key, value in weights.items():
+                    if key in model_state and model_state[key].shape == value.shape:
+                        compatible[key] = value
+                        loaded_base_keys.add(key)
+                    else:
+                        skipped_base_keys.add(key)
+                model.load_state_dict(compatible, strict=False)
+
             if os.path.exists(safetensors_index_path):
                 with open(safetensors_index_path, 'r') as f:
                     index = json.load(f)
@@ -708,22 +790,73 @@ class BaseExperiment(ABC):
                     shard_path = os.path.join(ckpt_dir, shard_file)
                     mprint(f"Loading shard: {shard_path}")
                     shard_state_dict = load_file(shard_path)
-                    model.load_state_dict(shard_state_dict, strict=False)
+                    load_compatible_base_weights(shard_state_dict)
                     del shard_state_dict
                     gc.collect()
             elif os.path.exists(safetensors_path):
                 state_dict = load_file(safetensors_path)
-                model.load_state_dict(state_dict, strict=False)
+                load_compatible_base_weights(state_dict)
             else:
                 raise FileNotFoundError(
                     f"No weights found at '{ckpt_dir}'. "
                     "Expected 'model.safetensors' or 'model.safetensors.index.json'."
                 )
 
+            if getattr(
+                model.action_head.config,
+                "action_only_training",
+                False,
+            ):
+                adapter_prefixes = (
+                    "action_head.model.state_encoder.",
+                    "action_head.model.action_encoder.",
+                    "action_head.model.action_decoder.",
+                )
+                required_shared_dit_keys = {
+                    key
+                    for key in model_state
+                    if key.startswith("action_head.model.")
+                    and not key.startswith(adapter_prefixes)
+                }
+                missing_shared_dit = sorted(
+                    required_shared_dit_keys - loaded_base_keys
+                )
+                if missing_shared_dit:
+                    raise RuntimeError(
+                        "Incomplete DreamZero-AgiBot shared DiT load: "
+                        + ", ".join(missing_shared_dit[:20])
+                    )
+                mprint(
+                    "[BASE LOAD] DreamZero-AgiBot loaded | "
+                    f"shared_dit_keys={len(required_shared_dit_keys)} "
+                    f"skipped_incompatible={len(skipped_base_keys)}"
+                )
+                mprint(
+                    "[EMBODIMENT] g2 logical_id=33 "
+                    "action_adapter_local_slot=0"
+                )
+
             if (hasattr(model, 'action_head')
                     and hasattr(model.action_head, 'inject_lora_after_loading')
                     and model.action_head.config.defer_lora_injection):
                 model.action_head.inject_lora_after_loading()
+
+            if cfg.pretrained_lora_path is not None:
+                mprint(
+                    f"Loading pretrained LoRA/action weights from: "
+                    f"{cfg.pretrained_lora_path}"
+                )
+                model.load_lora_weight(cfg.pretrained_lora_path)
+
+            if (
+                hasattr(model, "action_head")
+                and getattr(
+                    model.action_head.config,
+                    "action_only_training",
+                    False,
+                )
+            ):
+                model.action_head.configure_action_only_training()
 
             mprint("Successfully loaded pretrained weights")
 

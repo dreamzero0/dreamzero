@@ -1291,6 +1291,8 @@ class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
         shard_sampling_rate: float = 0.5,
         num_shards_to_sample: int = 2**20,
         allow_padding_at_end: bool = False,
+        active_hold_index_path: str | None = None,
+        active_window_ratio: float = 0.8,
     ):
         """
         Initialize the mixture dataset.
@@ -1317,6 +1319,25 @@ class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
         # Set properties
         self.shard_sampling_rate = shard_sampling_rate
         self.num_shards_to_sample = num_shards_to_sample
+        self.active_window_ratio = float(active_window_ratio)
+        if not 0.0 <= self.active_window_ratio <= 1.0:
+            raise ValueError("active_window_ratio must be in [0, 1]")
+        self._active_steps: set[tuple[int, int]] | None = None
+        if active_hold_index_path:
+            index_path = Path(active_hold_index_path)
+            with index_path.open() as stream:
+                active_hold = json.load(stream)
+            self._active_steps = {
+                (int(episode), int(step))
+                for episode, steps in active_hold["active"].items()
+                for step in steps
+            }
+            print(
+                "[G2 ACTIVE/HOLD SAMPLING] "
+                f"index={index_path} active={len(self._active_steps)} "
+                f"target_ratio={self.active_window_ratio:.2f} "
+                f"threshold={active_hold['arm_motion_threshold']:.8f}"
+            )
 
         # Calculate shard sampling weights
         all_shard_sampling_weights = []
@@ -1501,9 +1522,37 @@ class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
                 allowed_indices = allowed_indices[allowed_indices <= allowed_length]
                 for i in allowed_indices:
                     all_steps.append((trajectory_id, i))
+            sample_count = int(dataset.num_steps_per_shard * self.shard_sampling_rate)
             if self.training:
                 rng.shuffle(all_steps)
-            sampled_steps = all_steps[: int(dataset.num_steps_per_shard * self.shard_sampling_rate)]
+            if self._active_steps is None:
+                sampled_steps = all_steps[:sample_count]
+            else:
+                active_steps = [
+                    step for step in all_steps if step in self._active_steps
+                ]
+                hold_steps = [
+                    step for step in all_steps if step not in self._active_steps
+                ]
+                if self.training:
+                    rng.shuffle(active_steps)
+                    rng.shuffle(hold_steps)
+                active_count = min(
+                    len(active_steps),
+                    int(round(sample_count * self.active_window_ratio)),
+                )
+                hold_count = min(len(hold_steps), sample_count - active_count)
+                sampled_steps = (
+                    active_steps[:active_count] + hold_steps[:hold_count]
+                )
+                if len(sampled_steps) < sample_count:
+                    used = set(sampled_steps)
+                    sampled_steps.extend(
+                        step for step in all_steps if step not in used
+                    )
+                    sampled_steps = sampled_steps[:sample_count]
+                if self.training:
+                    rng.shuffle(sampled_steps)
             for trajectory_id, step_index in sampled_steps:
                 # print(
                 #     f"Loading step data from rank {self.rank}, worker {self.worker_id}: {dataset_index} {trajectory_id}, {step_index}"
