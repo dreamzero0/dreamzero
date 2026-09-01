@@ -45,6 +45,7 @@ from transformers.feature_extraction_utils import BatchFeature
 
 from groot.vla.model.n1_5.action_head.base_action_head import ActionHead
 from groot.vla.model.dreamzero.modules.flow_match_scheduler import FlowMatchScheduler
+from groot.vla.model.dreamzero.modules.noise_utils import generate_noise_samples
 from groot.vla.model.dreamzero.modules.vram_management import enable_vram_management, AutoWrappedModule, AutoWrappedLinear
 from groot.vla.model.dreamzero.modules.wan_video_text_encoder import T5RelativeEmbedding, T5LayerNorm
 from groot.vla.model.dreamzero.modules.flow_unipc_multistep_scheduler import FlowUniPCMultistepScheduler
@@ -813,9 +814,9 @@ class WANPolicyHead(ActionHead):
         return BatchFeature(data=output_dict)
 
     def generate_noise(self, shape, seed=None, device="cpu", dtype=torch.float16):
-        generator = None if seed is None else torch.Generator(device).manual_seed(seed)
-        noise = torch.randn(shape, generator=generator, device=device, dtype=dtype)
-        return noise
+        return generate_noise_samples(
+            (shape,), seed=seed, device=device, dtype=dtype
+        )[0]
     
     def _get_caches(
         self, kv_caches_input: list[KVCacheType],
@@ -1101,8 +1102,22 @@ class WANPolicyHead(ActionHead):
 
         end_vae_event.record()
 
-        noise_obs = self.generate_noise((image.shape[0], image.shape[1], self.num_frame_per_block, image.shape[3], image.shape[4]), seed=self.seed, device='cuda', dtype=torch.bfloat16)
-        noise_action = self.generate_noise((image.shape[0], self.action_horizon, self.model.action_dim), seed=self.seed, device='cuda', dtype=torch.bfloat16)
+        # Consume disjoint draws instead of restarting the seeded stream per modality.
+        noise_obs, noise_action = generate_noise_samples(
+            (
+                (
+                    image.shape[0],
+                    image.shape[1],
+                    self.num_frame_per_block,
+                    image.shape[3],
+                    image.shape[4],
+                ),
+                (image.shape[0], self.action_horizon, self.model.action_dim),
+            ),
+            seed=self.seed,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
         batch_size, num_channels, num_frames, height, width = noise_obs.shape
         ######### Generate video #########
         # DiT patch_embedding uses stride (1,2,2), so tokens per frame = (H//2)*(W//2)
