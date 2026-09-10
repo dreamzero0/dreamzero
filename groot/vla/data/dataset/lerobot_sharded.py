@@ -1474,7 +1474,17 @@ class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
         self._shards_sample_schedule = self.filter_shards_sample_schedule()
         self.curr_shard_index = -1
         self.cache_next_shard()
-        rng = np.random.default_rng(self.seed)
+        # Mix rank and worker id into the shuffle seed. With the base seed
+        # alone, every (rank, worker) draws an identical shuffle stream, so
+        # whenever two workers process the same shard at the same schedule
+        # position -- the common case for a small dataset with few shards --
+        # they emit identical batches. The schedule RNG in
+        # generate_shards_sample_schedule stays rank-identical by design;
+        # only the within-shard sample order differs per rank/worker.
+        rng = np.random.default_rng(
+            self.seed + 100003 * (self.rank * self.num_workers + self.worker_id)
+        )
+        audit_logged = 0
         for i, (dataset_index, shard_index) in enumerate(self.shards_sample_schedule):
             self.curr_shard_index += 1
             assert (
@@ -1508,6 +1518,16 @@ class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
                 rng.shuffle(all_steps)
             sampled_steps = all_steps[: int(dataset.num_steps_per_shard * self.shard_sampling_rate)]
             for trajectory_id, step_index in sampled_steps:
+                if audit_logged < 16:
+                    # First few samples per worker: makes cross-rank batch
+                    # duplication auditable straight from the job log.
+                    print(
+                        f"[sample-audit] rank={self.rank} worker={self.worker_id}"
+                        f" dataset={dataset_index} shard={shard_index}"
+                        f" traj={trajectory_id} step={step_index}",
+                        flush=True,
+                    )
+                    audit_logged += 1
                 # print(
                 #     f"Loading step data from rank {self.rank}, worker {self.worker_id}: {dataset_index} {trajectory_id}, {step_index}"
                 # )
