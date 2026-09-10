@@ -65,6 +65,28 @@ allowlist = [np_core.multiarray._reconstruct, np.ndarray, np.dtype]
 allowlist += [type(np.dtype(np.uint32))]
 torch.serialization.add_safe_globals(allowlist)
 
+# DeepSpeed resume state without the frozen base (docker/patches/0004).
+# transformers' Trainer passes exclude_frozen_parameters=True to DeepSpeed's
+# save_checkpoint only when the model is a PEFT PeftModel. This codebase injects
+# LoRA itself, so that gate is never true and every save writes the entire
+# frozen backbone into global_step*/mp_rank_00_model_states.pt (~85 GiB per
+# checkpoint) next to a <0.5 GB adapter. BaseTrainer._save_optimizer_and_scheduler
+# below flips the gate for the duration of the save. The load side must then be
+# non-strict, because the checkpoint no longer carries the frozen keys; both
+# call sites of deepspeed_load_checkpoint in transformers.trainer
+# (_inner_training_loop and _load_best_model) resolve the name from that
+# module's globals at call time, so wrapping it there covers both. The frozen
+# weights come from the pretrained base at model construction, exactly as on a
+# fresh start, so a resumed run trains against the same backbone.
+_ds_load_checkpoint_strict = transformers.trainer.deepspeed_load_checkpoint
+
+
+def _ds_load_checkpoint_nonstrict(deepspeed_engine, checkpoint_path, load_module_strict=True):
+    return _ds_load_checkpoint_strict(deepspeed_engine, checkpoint_path, load_module_strict=False)
+
+
+transformers.trainer.deepspeed_load_checkpoint = _ds_load_checkpoint_nonstrict
+
 # Define LayerNorm classes locally to replace deprecated ALL_LAYERNORM_LAYERS
 LAYERNORM_LAYERS = [
     torch.nn.LayerNorm,
@@ -478,6 +500,20 @@ class BaseTrainer(transformers.Trainer):
                     group.setdefault("bias_correction", True)
 
         return self.optimizer
+
+    def _save_optimizer_and_scheduler(self, output_dir):
+        # See the module-level note next to _ds_load_checkpoint_nonstrict. The
+        # DeepSpeed branch of the parent implementation passes
+        # exclude_frozen_parameters=True only when _is_peft_model(self.model) is
+        # true, and it looks that name up in its own module globals at call
+        # time, so the flip is scoped to exactly this save.
+        trainer_mod = transformers.trainer
+        original = trainer_mod._is_peft_model
+        trainer_mod._is_peft_model = lambda model: True
+        try:
+            return super()._save_optimizer_and_scheduler(output_dir)
+        finally:
+            trainer_mod._is_peft_model = original
 
     def save_model(self, output_dir: Optional[str], _internal_call: bool):
 
