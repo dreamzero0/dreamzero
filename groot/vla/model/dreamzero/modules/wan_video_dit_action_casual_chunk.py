@@ -356,6 +356,14 @@ class CausalWanSelfAttention(nn.Module):
             # With local attention, still need loop but optimize it
             # Pre-allocate output tensor
             output = torch.empty_like(q)
+
+            # First frame self-attention, matching the multimodal path.
+            # Prevent an uninitialized first-frame output.
+            output[:, :frame_seqlen] = self.attn(
+                q[:, :frame_seqlen],
+                k[:, :frame_seqlen],
+                v[:, :frame_seqlen],
+            )
             
             # Pre-compute block boundaries
             block_starts = [frame_seqlen + i * block_size for i in range(num_blocks)]
