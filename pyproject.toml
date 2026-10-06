@@ -58,7 +58,6 @@ dependencies = [
     "pandas",
     "evdev; sys_platform == 'linux'",
     "pybullet; sys_platform == 'linux'",
-    "gear",
     # Pin the MSC dependency version to prevent potential issues caused by publishing new releases.
     "multi-storage-client[boto3,msal,observability-otel]==0.33.0",
     "dm_tree",
