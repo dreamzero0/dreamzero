@@ -1073,11 +1073,21 @@ class CausalWanSelfAttention(nn.Module):
             new_v = new_v[:, -self.max_attention_size:]
 
             if action_register_length is not None:
-                x = self.attn(
-                    torch.cat([roped_query, roped_action_query], dim=1),
+                # State queries retain the block-local visibility used in training.
+                # Video/action queries still see the complete current register.
+                action_end = self.num_action_per_block
+                video_action_output = self.attn(
+                    torch.cat([roped_query, roped_action_query[:, :action_end]], dim=1),
                     torch.cat([new_k, roped_action_key], dim=1),
                     torch.cat([new_v, action_v], dim=1),
                 )
+                state_output = self._process_state_blocks(
+                    roped_action_query[:, action_end:],
+                    roped_action_key[:, action_end:],
+                    action_v[:, action_end:],
+                    self.num_state_per_block,
+                )
+                x = torch.cat([video_action_output, state_output], dim=1)
             else:
                 x = self.attn(
                     roped_query,
